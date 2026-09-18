@@ -1,0 +1,13 @@
+{
+  "name": "rollbook",
+  "version": "1.0.0",
+  "description": "Rent roll and ledger for a self-managing landlord. Zero dependencies.",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning server.js",
+    "test": "node --no-warnings=ExperimentalWarning test/run.js"
+  },
+  "engines": { "node": ">=22.13" },
+  "license": "UNLICENSED"
+}

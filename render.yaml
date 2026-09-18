@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: rollbook
+    runtime: node
+    plan: starter
+    buildCommand: "echo no build step needed"
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: false   # she deploys updates with one click in the Render dashboard; nothing changes on its own
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: NODE_VERSION
+        value: 22.22.2
+      - key: TZ
+        value: America/Chicago
+    disk:
+      name: rollbook-data
+      mountPath: /var/data
+      sizeGB: 1
