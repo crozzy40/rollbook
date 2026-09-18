@@ -35,7 +35,7 @@ async function req(method, p, body, opts = {}) {
 }
 const get = (p, o) => req('GET', p, null, o);
 const post = (p, b, o) => req('POST', p, b, o);
-async function follow(p, b, o) { const r = await post(p, b, o); assert.equal(r.status, 303, `expected redirect from ${p}, got ${r.status}`); return get(r.location); }
+async function follow(p, b, o) { const r = await post(p, b, o); assert.equal(r.status, 303, `expected redirect from ${p}, got ${r.status}`); return get(r.location.replace(/#.*$/, '')); }
 
 // Her workbook, in the shape SheetJS hands the parser (dates as Excel serials). Built to look like the real template.
 function fixtureSheets(year) {
@@ -57,8 +57,30 @@ function fixtureSheets(year) {
   return { Income: income, Expenses: expenses, Summary: [], Sheet2: receipts };
 }
 
+// ---- Stripe stand-in: enough of the API for Checkout sessions, on a local port
+const http = require('node:http');
+const STRIPE_PORT = PORT + 1;
+const sessions = {};
+const stripeMock = http.createServer((req, res) => {
+  let body = ''; req.on('data', c => body += c); req.on('end', () => {
+    const auth = req.headers.authorization || '';
+    const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    if (!/^Bearer sk_test_ok/.test(auth)) return send(401, { error: { message: 'Invalid API Key provided' } });
+    if (req.method === 'GET' && req.url === '/v1/account') return send(200, { id: 'acct_1', settings: { dashboard: { display_name: 'Test Landlord LLC' } } });
+    if (req.method === 'POST' && req.url === '/v1/checkout/sessions') {
+      const q = new URLSearchParams(body); const id = 'cs_test_' + Object.keys(sessions).length;
+      sessions[id] = { id, object: 'checkout.session', status: 'open', payment_status: 'unpaid', url: 'http://stripe.local/checkout/' + id, params: Object.fromEntries(q) };
+      return send(200, sessions[id]);
+    }
+    const m = req.url.match(/^\/v1\/checkout\/sessions\/(cs_[\w]+)/);
+    if (req.method === 'GET' && m && sessions[m[1]]) return send(200, sessions[m[1]]);
+    send(404, { error: { message: 'no such route ' + req.method + ' ' + req.url } });
+  });
+});
+
 (async () => {
-  const server = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(PORT), DATA_DIR }, stdio: ['ignore', 'pipe', 'pipe'] });
+  await new Promise(r => stripeMock.listen(STRIPE_PORT, r));
+  const server = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(PORT), DATA_DIR, STRIPE_API_BASE: `http://localhost:${STRIPE_PORT}` }, stdio: ['ignore', 'pipe', 'pipe'] });
   let serverLog = '';
   server.stdout.on('data', d => serverLog += d); server.stderr.on('data', d => serverLog += d);
   for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/health'); break; } catch (e) { await new Promise(r => setTimeout(r, 100)); } }
@@ -205,11 +227,124 @@ function fixtureSheets(year) {
       r = await get('/units'); assert.match(r.text, /100 Sample Ave/, 'the real building with the colliding name survives');
       r = await get(`/api/export/rentroll`); assert.ok(JSON.parse(r.text).rows.some(x => x.building === '100 Sample Ave' && x.tenant === 'Alice Example'));
     });
+    await test('building home page: band, figures, units, and rail entry', async () => {
+      const r = await get(`/buildings/${importResult.buildingId}`); assert.equal(r.status, 200);
+      assert.match(r.text, /class="bhero placeholder" href="\/buildings\/\d+\/edit#photo"/); assert.match(r.text, /Add a photo of the front/); assert.match(r.text, /collected of/); assert.match(r.text, /class="tile /); assert.match(r.text, /Recent payments/);
+      assert.match(r.text, /class="nav-group">Buildings</); assert.match(r.text, new RegExp(`class="bnav on"[^>]*>.*?1657 W Test`), 'current building highlighted in the rail');
+      const u = await get(`/units/${unitIds['1']}`); assert.match(u.text, /class="where in-building"/, 'unit page shows the location bar in-building'); assert.match(u.text, /where-name">1657 W Test</);
+      const t = await get('/'); assert.match(t.text, /class="where"><a class="where-main" href="\/units">/, 'admin pages show the portfolio, not a building');
+      const x = await get(`/expenses?building=${importResult.buildingId}`); assert.match(x.text, /class="where in-building"/, 'filtering by building puts you in it');
+      const sw = u.text.match(/<option value="\/buildings\/\d+"[^>]*>/g) || []; assert.ok(sw.length >= 1, 'switcher lists buildings');
+    });
+    await test('nickname shows everywhere the building is named; name on the books stays', async () => {
+      const bid = importResult.buildingId;
+      let r = await follow(`/buildings/${bid}`, { name: '1657 W Test', display_name: 'Hollywood', address: '1657 W Test Ave', notes: '' }); assert.match(r.text, /<h1>Hollywood/);
+      r = await get('/delinquency'); assert.doesNotMatch(r.text, /<span class="sub">1657 W Test/); r = await get('/'); assert.match(r.text, /Hollywood/);
+      r = await get(`/api/export/rentroll`); assert.equal(JSON.parse(r.text).rows[0].building, 'Hollywood');
+      const chk = JSON.parse((await post('/api/import/check', { ...parsed, building_name: '1657 W Test' }, { json: true })).text); assert.ok(chk.existing, 're-import still matches on the name on the books');
+      r = await follow(`/buildings/${bid}`, { name: '1657 W Test', display_name: '', address: '1657 W Test Ave', notes: '' }); assert.match(r.text, /<h1>1657 W Test/);
+    });
+    await test('photo upload, serve, and remove', async () => {
+      const bid = importResult.buildingId;
+      // smallest valid JPEG (1x1 grey)
+      const jpg = Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
+      await get(`/buildings/${bid}/edit`);
+      let r = await post(`/buildings/${bid}/photo`, { data: 'data:image/jpeg;base64,' + jpg.toString('base64') }, { json: true }); const j = JSON.parse(r.text); assert.equal(j.ok, true, r.text);
+      r = await fetch(BASE + '/photos/' + j.photo, { headers: { cookie } }); assert.equal(r.status, 200); assert.equal(r.headers.get('content-type'), 'image/jpeg');
+      r = await fetch(BASE + '/photos/' + j.photo, { redirect: 'manual' }); assert.equal(r.status, 303, 'photos need a login');
+      r = await get(`/buildings/${bid}`); assert.match(r.text, new RegExp(`class="bhero" href="/buildings/${bid}/edit#photo" style="background-image:url\\('/photos/${j.photo}'\\)`));
+      r = await post(`/buildings/${bid}/photo`, { data: 'data:image/png;base64,AAAA' }, { json: true }); assert.equal(JSON.parse(r.text).ok, false);
+      r = await follow(`/buildings/${bid}/photo/delete`, {}); assert.match(r.text, /Photo removed/);
+      r = await fetch(BASE + '/photos/' + j.photo, { headers: { cookie } }); assert.equal(r.status, 404, 'old file gone');
+    });
+    await test('buildings can be reordered', async () => {
+      let r = await get('/units'); const order = [...r.text.matchAll(/<section class="building" id="b(\d+)"/g)].map(m => m[1]); assert.ok(order.length >= 2);
+      await get(`/buildings/${order[1]}/edit`); r = await follow(`/buildings/${order[1]}/move`, { dir: 'up' }); assert.match(r.text, /Order updated/);
+      r = await get('/units'); const after = [...r.text.matchAll(/<section class="building" id="b(\d+)"/g)].map(m => m[1]); assert.equal(after[0], order[1]); assert.equal(after[1], order[0]);
+    });
     await test('delete a building with confirmation', async () => { let r = await get(`/buildings/${b2}/delete`); assert.match(r.text, /Delete Manual Bldg\?/); r = await follow(`/buildings/${b2}/delete`, {}); assert.match(r.text, /Building deleted/); assert.doesNotMatch(r.text, /Manual Bldg/); });
     await test('unknown page is a 404, not a crash', async () => { const r = await get('/nope/123'); assert.equal(r.status, 404); });
     await test('server log has no errors', async () => { assert.doesNotMatch(serverLog, /Error|TypeError|ReferenceError/); });
+    // ---- Phase 2: online payments
+    const { signWebhook } = require('../lib/stripe');
+    const WH = 'whsec_testsecret';
+    let payLink, payToken, tid2;
+    await test('pay link exists on the unit page and works without a login', async () => {
+      const u = await get(`/units/${unitIds['2']}`); payLink = (u.text.match(/value="(http[^"]+\/pay\/[A-Za-z0-9]+)"/) || [])[1];
+      assert.ok(payLink, 'pay link rendered'); payToken = payLink.split('/pay/')[1]; tid2 = u.text.match(/\/tenancies\/(\d+)\/payments/)[1];
+      const saved = cookie; cookie = '';
+      const r = await get(`/pay/${payToken}`); assert.equal(r.status, 200); assert.match(r.text, /Bob Sample/); assert.match(r.text, /not switched on yet/);
+      const bad = await get('/pay/nopenope1234'); assert.equal(bad.status, 404);
+      cookie = saved;
+    });
+    await test('settings: a bad key is rejected, a good one connects', async () => {
+      await get('/settings');
+      let r = await follow('/settings/stripe', { stripe_secret_key: 'sk_test_bad', stripe_webhook_secret: WH, pay_bank: '1', pay_card: '1', pay_card_fee_to_tenant: '1' }); assert.match(r.text, /Stripe rejected the key/);
+      r = await follow('/settings/stripe', { stripe_secret_key: 'sk_test_ok123', stripe_webhook_secret: '', pay_bank: '1', pay_card: '1', pay_card_fee_to_tenant: '1' }); assert.match(r.text, /Connected to Stripe as Test Landlord LLC \(test mode\)/);
+      assert.match(r.text, /Webhook secret is set/, 'blank webhook field keeps the earlier secret');
+    });
+    async function tenantPost(path, form) { const saved = cookie; cookie = ''; const r = await fetch(BASE + path, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(form).toString(), redirect: 'manual' }); cookie = saved; return r; }
+    async function webhook(event) { const raw = JSON.stringify(event); return fetch(BASE + '/stripe/webhook', { method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': signWebhook(raw, WH) }, body: raw }); }
+    let cardSession, bankSession;
+    await test('tenant starts a card payment: session created with rent + fee line items', async () => {
+      const r = await tenantPost(`/pay/${payToken}/checkout`, { amount: '1000', method: 'card' }); assert.equal(r.status, 303); const loc = r.headers.get('location'); assert.match(loc, /stripe\.local\/checkout\/cs_test_/);
+      cardSession = loc.split('/').pop(); const p = sessions[cardSession].params;
+      assert.equal(p['payment_method_types[0]'], 'card'); assert.equal(p['line_items[0][price_data][unit_amount]'], '100000'); assert.equal(p['line_items[1][price_data][product_data][name]'], 'Card processing fee');
+      const fee = Number(p['line_items[1][price_data][unit_amount]']); assert.ok(fee > 2900 && fee < 3200, 'fee ~ $30.20 on $1000: ' + fee);
+      assert.equal(p['metadata[tenancy_id]'], tid2); assert.match(p['success_url'], /session_id=\{CHECKOUT_SESSION_ID\}/);
+    });
+    await test('webhook with a bad signature is refused', async () => { const raw = JSON.stringify({ id: 'evt_x', type: 'checkout.session.completed' }); const r = await fetch(BASE + '/stripe/webhook', { method: 'POST', headers: { 'stripe-signature': 't=1,v1=deadbeef' }, body: raw }); assert.equal(r.status, 400); });
+    await test('card payment completes: lands on the ledger once, even if the webhook repeats', async () => {
+      sessions[cardSession].status = 'complete'; sessions[cardSession].payment_status = 'paid'; sessions[cardSession].payment_intent = 'pi_12345678';
+      const ev = { id: 'evt_1', type: 'checkout.session.completed', data: { object: sessions[cardSession] } };
+      let r = await webhook(ev); assert.equal((await r.json()).result, 'recorded');
+      r = await webhook(ev); assert.equal((await r.json()).result, 'duplicate');
+      r = await webhook({ ...ev, id: 'evt_1b' }); assert.equal((await r.json()).result, 'already recorded');
+      const u = await get(`/units/${unitIds['2']}`); assert.match(u.text, /Payment, Online \(card\)/); assert.equal((u.text.match(/Online \(card\)/g) || []).length >= 1, true);
+      assert.match(u.text, /incl\. \$3[01]\.\d\d card fee/);
+      const j = JSON.parse((await get('/api/export/rentroll')).text); const row = j.rows.find(x => x.tenant === 'Bob Sample'); assert.equal(row.last_method, 'Online (card)');
+    });
+    await test('tenant sees the done page as paid', async () => { const saved = cookie; cookie = ''; const r = await get(`/pay/${payToken}/done?session_id=${cardSession}`); cookie = saved; assert.match(r.text, /<h1[^>]*>Paid</); assert.match(r.text, /\$1,000\.00 has been received/); });
+    await test('bank payment: pending after checkout, then settles on async success', async () => {
+      const r = await tenantPost(`/pay/${payToken}/checkout`, { amount: '500', method: 'bank' }); bankSession = r.headers.get('location').split('/').pop();
+      const p = sessions[bankSession].params; assert.equal(p['payment_method_types[0]'], 'us_bank_account'); assert.equal(p['line_items[1][price_data][unit_amount]'], undefined, 'no fee on bank');
+      sessions[bankSession].status = 'complete'; sessions[bankSession].payment_status = 'unpaid';
+      let w = await webhook({ id: 'evt_2', type: 'checkout.session.completed', data: { object: sessions[bankSession] } }); assert.equal((await w.json()).result, 'pending');
+      let u = await get(`/units/${unitIds['2']}`); assert.match(u.text, /\$500\.00 bank payment on its way/); assert.match(u.text, /Clearing/);
+      let d = await get('/delinquency'); if (new RegExp(`href="/units/${unitIds['2']}"`).test(d.text)) assert.match(d.text, /\$500\.00 clearing/);
+      const saved = cookie; cookie = ''; const done = await get(`/pay/${payToken}/done?session_id=${bankSession}`); cookie = saved; assert.match(done.text, /On its way/);
+      sessions[bankSession].payment_status = 'paid'; sessions[bankSession].payment_intent = 'pi_bank1';
+      w = await webhook({ id: 'evt_3', type: 'checkout.session.async_payment_succeeded', data: { object: sessions[bankSession] } }); assert.equal((await w.json()).result, 'recorded');
+      u = await get(`/units/${unitIds['2']}`); assert.match(u.text, /Payment, Online \(bank\)/); assert.doesNotMatch(u.text, /on its way/);
+    });
+    await test('bank payment failure is marked, nothing lands', async () => {
+      const r = await tenantPost(`/pay/${payToken}/checkout`, { amount: '250', method: 'bank' }); const sid = r.headers.get('location').split('/').pop();
+      sessions[sid].status = 'complete';
+      await webhook({ id: 'evt_4', type: 'checkout.session.completed', data: { object: sessions[sid] } });
+      const w = await webhook({ id: 'evt_5', type: 'checkout.session.async_payment_failed', data: { object: sessions[sid] } }); assert.equal((await w.json()).result, 'failed');
+      const u = await get(`/units/${unitIds['2']}`); assert.doesNotMatch(u.text, /\$250\.00/);
+      const st = await get('/settings'); assert.match(st.text, /Failed/);
+    });
+    await test('done page syncs a paid session even with no webhook', async () => {
+      const r = await tenantPost(`/pay/${payToken}/checkout`, { amount: '75', method: 'card' }); const sid = r.headers.get('location').split('/').pop();
+      sessions[sid].status = 'complete'; sessions[sid].payment_status = 'paid'; sessions[sid].payment_intent = 'pi_sync1';
+      const saved = cookie; cookie = ''; const d = await get(`/pay/${payToken}/done?session_id=${sid}`); cookie = saved; assert.match(d.text, /<h1[^>]*>Paid</);
+      const u = await get(`/units/${unitIds['2']}`); assert.match(u.text, /\$75\.00/);
+    });
+    await test('turning cards off removes the option; a card attempt is refused', async () => {
+      await get('/settings'); await follow('/settings/stripe', { stripe_secret_key: '', stripe_webhook_secret: '', pay_bank: '1', pay_card: '0', pay_card_fee_to_tenant: '1' });
+      const saved = cookie; cookie = ''; const r = await get(`/pay/${payToken}`); cookie = saved; assert.doesNotMatch(r.text, /value="card"/);
+      const c = await tenantPost(`/pay/${payToken}/checkout`, { amount: '100', method: 'card' }); assert.equal(c.status, 400);
+    });
+    await test('new link kills the old one; moved-out tenant link stops working', async () => {
+      await get(`/units/${unitIds['2']}`); const r = await follow(`/tenancies/${tid2}/pay-link/reset`, {}); assert.match(r.text, /New pay link made/);
+      const saved = cookie; cookie = ''; const old = await get(`/pay/${payToken}`); cookie = saved; assert.equal(old.status, 404);
+      const u = await get(`/units/${unitIds['3']}`); const link3 = u.text.match(/value="(http[^"]+\/pay\/[A-Za-z0-9]+)"/)[1]; const tok3 = link3.split('/pay/')[1]; const t3 = u.text.match(/\/tenancies\/(\d+)\/move-out/)[1];
+      await follow(`/tenancies/${t3}/move-out`, { move_out: `${cur}-28` });
+      cookie = ''; const gone = await get(`/pay/${tok3}`); cookie = saved; assert.equal(gone.status, 404);
+    });
   } finally {
-    server.kill();
+    server.kill(); stripeMock.close();
     fs.rmSync(DATA_DIR, { recursive: true, force: true });
   }
   console.log(`\n${passed} passed, ${failed} failed`);

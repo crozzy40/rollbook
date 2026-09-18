@@ -7,14 +7,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { URL } = require('node:url');
 
-const { db, DB_PATH, now, getSetting, setSetting, transaction } = require('./lib/db');
+const { db, DB_PATH, PHOTO_DIR, now, getSetting, setSetting, transaction } = require('./lib/db');
 const L = require('./lib/ledger');
 const auth = require('./lib/auth');
 const importer = require('./lib/importer');
 const demo = require('./lib/demo');
+const pay = require('./lib/pay');
+const stripe = require('./lib/stripe');
 const V = require('./lib/views');
 const V2 = require('./lib/views2');
-const { CATEGORIES, PAYMENT_METHODS, UNIT_KINDS, esc } = require('./lib/util');
+const { CATEGORIES, PAYMENT_METHODS, UNIT_KINDS, esc, bname } = require('./lib/util');
+const crypto = require('node:crypto');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC = path.join(__dirname, 'public');
@@ -69,15 +72,30 @@ const M = v => (/^\d{4}-\d{2}$/.test(S(v)) ? S(v) : null);
 
 function ctxFor(req, token) {
   const rows = token ? L.portfolioRows() : [];
+  const owedBy = {};
+  for (const r of rows) if (r.balance > 0) owedBy[r.building_id] = (owedBy[r.building_id] || 0) + r.balance;
+  const buildings = token ? buildingsAll().map(b => ({ ...b, owed: owedBy[b.id] || 0 })) : [];
   return {
     csrf: auth.csrfFor(token),
     portfolioName: getSetting('portfolio_name', 'My properties'),
     ownerName: getSetting('owner_name', ''),
     owedCount: rows.filter(r => r.balance > 0).length,
+    buildings,
+    buildingId: null,
+    building: null,
     flash: null,
   };
 }
+function inBuilding(ctx, id) { ctx.buildingId = Number(id); ctx.building = (ctx.buildings || []).find(b => b.id === Number(id)) || buildingById(id); return ctx; }
 
+function servePhoto(req, res, name) {
+  if (!/^[a-f0-9]{24}\.jpg$/.test(name)) return false;
+  const file = path.join(PHOTO_DIR, name);
+  if (!fs.existsSync(file)) return false;
+  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400' });
+  fs.createReadStream(file).pipe(res);
+  return true;
+}
 function serveStatic(req, res, pathname) {
   const file = path.normalize(path.join(PUBLIC, pathname));
   if (!file.startsWith(PUBLIC) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return false;
@@ -89,7 +107,7 @@ function serveStatic(req, res, pathname) {
 
 // ---------------------------------------------------------------- data helpers
 function buildingsAll() { return db.prepare('SELECT * FROM buildings ORDER BY sort, name').all(); }
-function unitsAll() { return db.prepare('SELECT u.*, b.name AS building_name FROM units u JOIN buildings b ON b.id = u.building_id ORDER BY b.sort, b.name, u.sort, u.label').all(); }
+function unitsAll() { return db.prepare('SELECT u.*, COALESCE(NULLIF(b.display_name, \'\'), b.name) AS building_name FROM units u JOIN buildings b ON b.id = u.building_id ORDER BY b.sort, b.name, u.sort, u.label').all(); }
 function unitById(id) { return db.prepare('SELECT * FROM units WHERE id = ?').get(id); }
 function buildingById(id) { return db.prepare('SELECT * FROM buildings WHERE id = ?').get(id); }
 function activeTenancy(unitId) { return db.prepare(`SELECT * FROM tenancies WHERE unit_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1`).get(unitId); }
@@ -100,7 +118,7 @@ function expenseRowsFor(filters) {
   if (filters.period) { where.push('substr(e.date,1,7) = ?'); args.push(filters.period); }
   else if (filters.year) { where.push('substr(e.date,1,4) = ?'); args.push(String(filters.year)); }
   if (filters.category) { where.push('e.category = ?'); args.push(filters.category); }
-  return db.prepare(`SELECT e.*, b.name AS building_name, u.label AS unit_label FROM expenses e JOIN buildings b ON b.id = e.building_id LEFT JOIN units u ON u.id = e.unit_id ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.date DESC, e.id DESC LIMIT 2000`).all(...args);
+  return db.prepare(`SELECT e.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name, u.label AS unit_label FROM expenses e JOIN buildings b ON b.id = e.building_id LEFT JOIN units u ON u.id = e.unit_id ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY e.date DESC, e.id DESC LIMIT 2000`).all(...args);
 }
 
 // ---------------------------------------------------------------- auth pages
@@ -149,11 +167,11 @@ get('/', (req, res, ctx) => {
   const month = L.monthSummary(cur);
   const today = L.todayISO();
   const leases = rows.filter(r => r.lease_end).map(r => ({ ...r, days: L.daysBetween(today, r.lease_end) })).filter(r => r.days <= 90).sort((a, b) => a.days - b.days);
-  const work = db.prepare(`SELECT w.*, b.name AS building_name, u.label AS unit_label FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id WHERE w.status = 'open' ORDER BY w.opened_at DESC LIMIT 5`).all();
+  const work = db.prepare(`SELECT w.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name, u.label AS unit_label FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id WHERE w.status = 'open' ORDER BY w.opened_at DESC LIMIT 5`).all();
   const collectedBy = {}; const dueBy = {};
   for (const r of db.prepare(`SELECT b.id, COALESCE(SUM(p.amount),0) v FROM payments p JOIN tenancies t ON t.id = p.tenancy_id JOIN units u ON u.id = t.unit_id JOIN buildings b ON b.id = u.building_id WHERE substr(p.date,1,7) = ? GROUP BY b.id`).all(cur)) collectedBy[r.id] = r.v;
   for (const r of db.prepare(`SELECT b.id, COALESCE(SUM(c.amount),0) v FROM charges c JOIN tenancies t ON t.id = c.tenancy_id JOIN units u ON u.id = t.unit_id JOIN buildings b ON b.id = u.building_id WHERE c.period = ? AND t.status = 'active' GROUP BY b.id`).all(cur)) dueBy[r.id] = r.v;
-  const buildings = board.map(b => ({ id: b.id, name: b.name, demo: b.demo, units: b.units.length, occupied: b.units.filter(u => !u.vacant).length, due: dueBy[b.id] || 0, collected: collectedBy[b.id] || 0, owed: b.units.reduce((s, u) => s + (u.balance > 0 ? u.balance : 0), 0) }));
+  const buildings = board.map(b => ({ id: b.id, name: b.name, display_name: b.display_name, photo: b.photo, demo: b.demo, units: b.units.length, occupied: b.units.filter(u => !u.vacant).length, due: dueBy[b.id] || 0, collected: collectedBy[b.id] || 0, owed: b.units.reduce((s, u) => s + (u.balance > 0 ? u.balance : 0), 0) }));
   const vacantCount = board.reduce((s, b) => s + b.units.filter(u => u.vacant).length, 0);
   html(res, V.dashboard(ctx, { month, rows, leases, work, buildings, vacantCount }));
 });
@@ -162,7 +180,8 @@ get('/', (req, res, ctx) => {
 get('/delinquency', (req, res, ctx, token, q) => {
   let rows = L.portfolioRows();
   const buildingId = S(q.get('building') || '');
-  if (buildingId) rows = rows.filter(r => String(r.building_id) === buildingId);
+  if (buildingId) { rows = rows.filter(r => String(r.building_id) === buildingId); inBuilding(ctx, buildingId); }
+  const pendingBy = pay.pendingAll(); rows = rows.map(r => ({ ...r, pendingOnline: pendingBy[r.tenancy_id] || 0 }));
   html(res, V.delinquency(ctx, rows, { buildings: buildingsAll(), buildingId, graceDays: getSetting('grace_days'), lateFeeKind: getSetting('late_fee_kind'), lateFeeAmount: getSetting('late_fee_amount'), rentDueDay: getSetting('rent_due_day') }));
 });
 
@@ -174,49 +193,110 @@ post('/buildings/new', async (req, res, ctx) => {
   if (!S(f.name)) return redirect(res, '/units/new-building', { kind: 'error', text: 'Give the building a name.' });
   const sort = db.prepare('SELECT COALESCE(MAX(sort),0) s FROM buildings').get().s + 1;
   const r = db.prepare('INSERT INTO buildings(name,address,notes,sort,demo,created_at) VALUES (?,?,?,?,0,?)').run(S(f.name, 80), S(f.address), S(f.notes, 2000), sort, now());
-  redirect(res, `/buildings/${r.lastInsertRowid}`, { text: 'Building added. Now add its units.' });
+  redirect(res, `/buildings/${r.lastInsertRowid}/edit#units`, { text: 'Building added. Now add its units.' });
 });
+function buildingUnits(bid) {
+  return db.prepare(`SELECT u.*, (SELECT tenant_name FROM tenancies t WHERE t.unit_id = u.id AND t.status = 'active' ORDER BY id DESC LIMIT 1) AS tenant_name FROM units u WHERE u.building_id = ? ORDER BY u.sort, u.label`).all(bid);
+}
 get('/buildings/:id', (req, res, ctx, token, q, p) => {
   const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
-  const units = db.prepare(`SELECT u.*, (SELECT tenant_name FROM tenancies t WHERE t.unit_id = u.id AND t.status = 'active' ORDER BY id DESC LIMIT 1) AS tenant_name FROM units u WHERE u.building_id = ? ORDER BY u.sort, u.label`).all(b.id);
-  html(res, V.buildingPage(ctx, b, units, false));
+  inBuilding(ctx, b.id);
+  const cur = L.currentPeriod(), today = L.todayISO();
+  const board = L.unitBoard().find(x => x.id === b.id);
+  const units = board ? board.units : [];
+  const rows = L.portfolioRows().filter(r => r.building_id === b.id);
+  const owedRows = rows.filter(r => r.balance > 0).sort((a, c) => c.balance - a.balance);
+  const due = db.prepare(`SELECT COALESCE(SUM(c.amount),0) v FROM charges c JOIN tenancies t ON t.id = c.tenancy_id JOIN units u ON u.id = t.unit_id WHERE u.building_id = ? AND c.period = ? AND t.status = 'active'`).get(b.id, cur).v;
+  const collected = db.prepare(`SELECT COALESCE(SUM(p.amount),0) v FROM payments p JOIN tenancies t ON t.id = p.tenancy_id JOIN units u ON u.id = t.unit_id WHERE u.building_id = ? AND substr(p.date,1,7) = ?`).get(b.id, cur).v;
+  const spent = db.prepare(`SELECT COALESCE(SUM(amount),0) v FROM expenses WHERE building_id = ? AND substr(date,1,7) = ?`).get(b.id, cur).v;
+  const since30 = L.todayISO(new Date(Date.now() - 30 * 86400000)), since60 = L.todayISO(new Date(Date.now() - 60 * 86400000));
+  const recentPayments = db.prepare(`SELECT p.date, p.amount, p.method, t.tenant_name, u.id AS unit_id, u.label AS unit_label, u.kind AS unit_kind FROM payments p JOIN tenancies t ON t.id = p.tenancy_id JOIN units u ON u.id = t.unit_id WHERE u.building_id = ? AND p.date >= ? ORDER BY p.date DESC, p.id DESC LIMIT 8`).all(b.id, since30);
+  const expenses = db.prepare(`SELECT * FROM expenses WHERE building_id = ? AND date >= ? ORDER BY date DESC, id DESC LIMIT 8`).all(b.id, since60);
+  const work = db.prepare(`SELECT w.*, u.label AS unit_label FROM work_orders w LEFT JOIN units u ON u.id = w.unit_id WHERE w.building_id = ? AND w.status = 'open' ORDER BY w.opened_at DESC LIMIT 8`).all(b.id);
+  const leases = rows.filter(r => r.lease_end).map(r => ({ ...r, days: L.daysBetween(today, r.lease_end) })).filter(r => r.days <= 90).sort((a, c) => a.days - c.days).slice(0, 8);
+  html(res, V.buildingHome(ctx, { b, units, month: { period: cur, due: L.round2(due), collected: L.round2(collected), expenses: L.round2(spent) }, owedRows, expenses, work, leases, recentPayments }));
+});
+get('/buildings/:id/edit', (req, res, ctx, token, q, p) => {
+  const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
+  inBuilding(ctx, b.id);
+  const all = buildingsAll(); const i = all.findIndex(x => x.id === b.id);
+  html(res, V.buildingPage(ctx, b, buildingUnits(b.id), false, { canUp: i > 0, canDown: i >= 0 && i < all.length - 1 }));
 });
 post('/buildings/:id', async (req, res, ctx, token, q, p) => {
   const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
   const f = parseForm(await readBody(req));
-  db.prepare('UPDATE buildings SET name = ?, address = ?, notes = ? WHERE id = ?').run(S(f.name, 80) || b.name, S(f.address), S(f.notes, 2000), b.id);
+  db.prepare('UPDATE buildings SET name = ?, display_name = ?, address = ?, notes = ? WHERE id = ?').run(S(f.name, 80) || b.name, S(f.display_name, 60), S(f.address), S(f.notes, 2000), b.id);
   redirect(res, `/buildings/${b.id}`, { text: 'Saved.' });
 });
 post('/buildings/:id/units', async (req, res, ctx, token, q, p) => {
   const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
   const f = parseForm(await readBody(req));
   const label = S(f.label, 40);
-  if (!label) return redirect(res, `/buildings/${b.id}`, { kind: 'error', text: 'The unit needs a label.' });
-  if (db.prepare('SELECT 1 FROM units WHERE building_id = ? AND lower(label) = lower(?)').get(b.id, label)) return redirect(res, `/buildings/${b.id}`, { kind: 'error', text: `There is already a unit called "${label}" here.` });
+  if (!label) return redirect(res, `/buildings/${b.id}/edit#units`, { kind: 'error', text: 'The unit needs a label.' });
+  if (db.prepare('SELECT 1 FROM units WHERE building_id = ? AND lower(label) = lower(?)').get(b.id, label)) return redirect(res, `/buildings/${b.id}/edit#units`, { kind: 'error', text: `There is already a unit called "${label}" here.` });
   const sort = db.prepare('SELECT COALESCE(MAX(sort),0) s FROM units WHERE building_id = ?').get(b.id).s + 1;
   db.prepare('INSERT INTO units(building_id,label,kind,notes,sort) VALUES (?,?,?,?,?)').run(b.id, label, UNIT_KINDS.includes(f.kind) ? f.kind : 'apartment', '', sort);
-  redirect(res, `/buildings/${b.id}`, { text: `Unit ${label} added.` });
+  redirect(res, `/buildings/${b.id}/edit#units`, { text: `Unit ${label} added.` });
+});
+post('/buildings/:id/move', async (req, res, ctx, token, q, p) => {
+  const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
+  const f = parseForm(await readBody(req));
+  const all = buildingsAll(); const i = all.findIndex(x => x.id === b.id);
+  const j = f.dir === 'up' ? i - 1 : i + 1;
+  if (j >= 0 && j < all.length) {
+    transaction(() => { all.forEach((x, k) => db.prepare('UPDATE buildings SET sort = ? WHERE id = ?').run(k + 1, x.id)); // normalize
+      db.prepare('UPDATE buildings SET sort = ? WHERE id = ?').run(j + 1, b.id); db.prepare('UPDATE buildings SET sort = ? WHERE id = ?').run(i + 1, all[j].id); });
+  }
+  redirect(res, `/buildings/${b.id}/edit`, { text: 'Order updated.' });
+});
+// Photo arrives as a JPEG data URL, already resized in the browser. Saved under a random name; the old one is removed.
+post('/buildings/:id/photo', async (req, res, ctx, token, q, p) => {
+  const b = buildingById(p.id); if (!b) return json(res, { ok: false, error: 'No such building.' }, 404);
+  let body; try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) { return json(res, { ok: false, error: 'Could not read the photo.' }, 400); }
+  if (body._csrf !== ctx.csrf) return json(res, { ok: false, error: 'The page expired. Reload and try again.' }, 403);
+  const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(String(body.data || ''));
+  if (!m) return json(res, { ok: false, error: 'Expected a JPEG photo.' }, 400);
+  const buf = Buffer.from(m[1], 'base64');
+  if (buf.length < 100 || buf.length > 3 * 1024 * 1024) return json(res, { ok: false, error: 'Photo must be under 3 MB after resizing.' }, 400);
+  if (buf[0] !== 0xFF || buf[1] !== 0xD8) return json(res, { ok: false, error: 'That is not a JPEG.' }, 400);
+  const name = crypto.randomBytes(12).toString('hex') + '.jpg';
+  fs.writeFileSync(path.join(PHOTO_DIR, name), buf);
+  if (b.photo) { try { fs.unlinkSync(path.join(PHOTO_DIR, b.photo)); } catch (e) { } }
+  db.prepare('UPDATE buildings SET photo = ? WHERE id = ?').run(name, b.id);
+  json(res, { ok: true, photo: name });
+});
+post('/buildings/:id/photo/delete', (req, res, ctx, token, q, p) => {
+  const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
+  if (b.photo) { try { fs.unlinkSync(path.join(PHOTO_DIR, b.photo)); } catch (e) { } }
+  db.prepare("UPDATE buildings SET photo = '' WHERE id = ?").run(b.id);
+  redirect(res, `/buildings/${b.id}/edit`, { text: 'Photo removed.' });
 });
 get('/buildings/:id/delete', (req, res, ctx, token, q, p) => {
   const b = buildingById(p.id); if (!b) return notFound(req, res, ctx);
+  inBuilding(ctx, b.id);
   const n = db.prepare('SELECT COUNT(*) c FROM units WHERE building_id = ?').get(b.id).c;
-  html(res, V.confirmDelete(ctx, { title: `Delete ${b.name}?`, text: `This removes the building, its ${n} unit(s), every tenant ledger, and every expense logged to it. There is no undo. Download a backup first if you are unsure.`, action: `/buildings/${b.id}/delete`, back: `/buildings/${b.id}` }));
+  html(res, V.confirmDelete(ctx, { title: `Delete ${bname(b)}?`, text: `This removes the building, its ${n} unit(s), every tenant ledger, and every expense logged to it. There is no undo. Download a backup first if you are unsure.`, action: `/buildings/${b.id}/delete`, back: `/buildings/${b.id}/edit` }));
 });
 post('/buildings/:id/delete', (req, res, ctx, token, q, p) => {
+  const b = buildingById(p.id);
+  if (b && b.photo) { try { fs.unlinkSync(path.join(PHOTO_DIR, b.photo)); } catch (e) { } }
   db.prepare('DELETE FROM buildings WHERE id = ?').run(p.id);
   redirect(res, '/units', { text: 'Building deleted.' });
 });
 
 get('/units/:id', (req, res, ctx, token, q, p) => {
   const unit = unitById(p.id); if (!unit) return notFound(req, res, ctx);
-  const building = buildingById(unit.building_id);
+  const building = buildingById(unit.building_id); inBuilding(ctx, building.id);
   const tenancy = activeTenancy(unit.id);
   const bal = tenancy ? L.tenancyBalance(tenancy.id) : null;
   const past = db.prepare(`SELECT * FROM tenancies WHERE unit_id = ? AND status = 'ended' ORDER BY move_out DESC`).all(unit.id).map(t => ({ ...t, balance: L.tenancyBalance(t.id).balance }));
-  html(res, V.unitPage(ctx, { unit, building, tenancy, bal, past }));
+  const payLink = tenancy ? pay.payUrl(req, pay.tokenFor(tenancy.id)) : null;
+  const pending = tenancy ? pay.pendingFor(tenancy.id) : [];
+  html(res, V.unitPage(ctx, { unit, building, tenancy, bal, past, payLink, pending, online: stripe.isConfigured() }));
 });
 get('/units/:id/edit', (req, res, ctx, token, q, p) => {
   const unit = unitById(p.id); if (!unit) return notFound(req, res, ctx);
+  inBuilding(ctx, unit.building_id);
   html(res, V.unitEdit(ctx, unit, buildingById(unit.building_id)));
 });
 post('/units/:id/edit', async (req, res, ctx, token, q, p) => {
@@ -232,13 +312,14 @@ get('/units/:id/delete', (req, res, ctx, token, q, p) => {
 post('/units/:id/delete', (req, res, ctx, token, q, p) => {
   const unit = unitById(p.id); if (!unit) return notFound(req, res, ctx);
   db.prepare('DELETE FROM units WHERE id = ?').run(unit.id);
-  redirect(res, `/units#b${unit.building_id}`, { text: 'Unit deleted.' });
+  redirect(res, `/buildings/${unit.building_id}`, { text: 'Unit deleted.' });
 });
 
 // ---------------------------------------------------------------- tenancies
 get('/units/:id/move-in', (req, res, ctx, token, q, p) => {
   const unit = unitById(p.id); if (!unit) return notFound(req, res, ctx);
   if (activeTenancy(unit.id)) return redirect(res, `/units/${unit.id}`, { kind: 'warn', text: 'Someone already lives here. Move them out first.' });
+  inBuilding(ctx, unit.building_id);
   html(res, V.tenancyForm(ctx, { unit, building: buildingById(unit.building_id), tenancy: null, isNew: true }));
 });
 function tenancyFromForm(f) {
@@ -258,7 +339,7 @@ post('/units/:id/move-in', async (req, res, ctx, token, q, p) => {
 });
 get('/tenancies/:id/edit', (req, res, ctx, token, q, p) => {
   const t = tenancyById(p.id); if (!t) return notFound(req, res, ctx);
-  const unit = unitById(t.unit_id);
+  const unit = unitById(t.unit_id); inBuilding(ctx, unit.building_id);
   html(res, V.tenancyForm(ctx, { unit, building: buildingById(unit.building_id), tenancy: t, isNew: false }));
 });
 post('/tenancies/:id/edit', async (req, res, ctx, token, q, p) => {
@@ -279,7 +360,8 @@ post('/tenancies/:id/edit', async (req, res, ctx, token, q, p) => {
 });
 get('/tenancies/:id/move-out', (req, res, ctx, token, q, p) => {
   const t = tenancyById(p.id); if (!t) return notFound(req, res, ctx);
-  html(res, V.moveOutPage(ctx, t, unitById(t.unit_id), L.tenancyBalance(t.id)));
+  const unit = unitById(t.unit_id); inBuilding(ctx, unit.building_id);
+  html(res, V.moveOutPage(ctx, t, unit, L.tenancyBalance(t.id)));
 });
 post('/tenancies/:id/move-out', async (req, res, ctx, token, q, p) => {
   const t = tenancyById(p.id); if (!t) return notFound(req, res, ctx);
@@ -330,9 +412,35 @@ for (const kind of ['payments', 'charges']) {
   });
 }
 
+// ---------------------------------------------------------------- pay links (owner side)
+post('/tenancies/:id/pay-link/reset', (req, res, ctx, token, q, p) => {
+  const t = tenancyById(p.id); if (!t) return notFound(req, res, ctx);
+  pay.resetToken(t.id);
+  redirect(res, `/units/${t.unit_id}#paylink`, { text: 'New pay link made. The old one no longer works.' });
+});
+post('/settings/stripe', async (req, res, ctx) => {
+  const f = parseForm(await readBody(req));
+  const sk = S(f.stripe_secret_key, 200), wh = S(f.stripe_webhook_secret, 200);
+  if (sk && !/^sk_(test|live)_[A-Za-z0-9]+$/.test(sk)) return redirect(res, '/settings#online', { kind: 'error', text: 'The secret key should start with sk_live_ or sk_test_.' });
+  if (wh && !/^whsec_[A-Za-z0-9]+$/.test(wh)) return redirect(res, '/settings#online', { kind: 'error', text: 'The webhook signing secret should start with whsec_.' });
+  if (sk) setSetting('stripe_secret_key', sk); else if (f.clear_keys === '1') setSetting('stripe_secret_key', '');
+  if (wh) setSetting('stripe_webhook_secret', wh); else if (f.clear_keys === '1') setSetting('stripe_webhook_secret', '');
+  setSetting('pay_bank', f.pay_bank === '1' ? '1' : '0');
+  setSetting('pay_card', f.pay_card === '1' ? '1' : '0');
+  setSetting('pay_card_fee_to_tenant', f.pay_card_fee_to_tenant === '1' ? '1' : '0');
+  if (!getSetting('stripe_secret_key')) return redirect(res, '/settings#online', { text: 'Saved.' });
+  try {
+    const acct = await stripe.request('GET', '/v1/account');
+    redirect(res, '/settings#online', { text: `Connected to Stripe as ${acct.settings && acct.settings.dashboard && acct.settings.dashboard.display_name || acct.business_profile && acct.business_profile.name || acct.id}${stripe.isTestMode() ? ' (test mode)' : ''}.` });
+  } catch (e) {
+    redirect(res, '/settings#online', { kind: 'error', text: `Saved, but Stripe rejected the key: ${e.message}` });
+  }
+});
+
 // ---------------------------------------------------------------- expenses
 get('/expenses', (req, res, ctx, token, q) => {
   const filters = { building: S(q.get('building') || ''), period: M(q.get('period') || '') || '', year: /^\d{4}$/.test(q.get('year') || '') ? q.get('year') : '', category: CATEGORIES.includes(q.get('category')) ? q.get('category') : '' };
+  if (filters.building) inBuilding(ctx, filters.building);
   const rows = expenseRowsFor(filters);
   const total = L.round2(rows.reduce((s, e) => s + e.amount, 0));
   const cats = {};
@@ -343,7 +451,9 @@ get('/expenses', (req, res, ctx, token, q) => {
 get('/expenses/new', (req, res, ctx, token, q) => {
   const buildings = buildingsAll();
   if (!buildings.length) return redirect(res, '/units/new-building', { kind: 'warn', text: 'Add a building before logging expenses.' });
-  html(res, V2.expenseForm(ctx, { e: null, buildings, units: unitsAll(), isNew: true }));
+  const pre = /^\d+$/.test(q.get('building') || '') ? { building_id: Number(q.get('building')) } : null;
+  if (pre) inBuilding(ctx, pre.building_id);
+  html(res, V2.expenseForm(ctx, { e: pre ? { ...pre, unit_id: '', date: L.todayISO(), category: 'Repairs & maintenance', description: '', vendor: '', amount: '', memo: '' } : null, buildings, units: unitsAll(), isNew: true }));
 });
 function expenseFromForm(f) {
   return { building_id: Number(f.building_id) || 0, unit_id: Number(f.unit_id) || null, date: D(f.date) || L.todayISO(), category: CATEGORIES.includes(f.category) ? f.category : 'Other', description: S(f.description, 200), vendor: S(f.vendor, 120), amount: N(f.amount), memo: S(f.memo, 300) };
@@ -358,6 +468,7 @@ post('/expenses/new', async (req, res, ctx) => {
 });
 get('/expenses/:id/edit', (req, res, ctx, token, q, p) => {
   const e = db.prepare('SELECT * FROM expenses WHERE id = ?').get(p.id); if (!e) return notFound(req, res, ctx);
+  inBuilding(ctx, e.building_id);
   html(res, V2.expenseForm(ctx, { e, buildings: buildingsAll(), units: unitsAll(), isNew: false }));
 });
 post('/expenses/:id/edit', async (req, res, ctx, token, q, p) => {
@@ -379,13 +490,15 @@ get('/more', (req, res, ctx) => html(res, V.morePage(ctx)));
 
 // ---------------------------------------------------------------- work orders
 get('/work', (req, res, ctx) => {
-  const all = db.prepare(`SELECT w.*, b.name AS building_name, u.label AS unit_label FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id ORDER BY w.opened_at DESC, w.id DESC`).all();
+  const all = db.prepare(`SELECT w.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name, u.label AS unit_label FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id ORDER BY w.opened_at DESC, w.id DESC`).all();
   html(res, V2.workPage(ctx, { open: all.filter(w => w.status === 'open'), done: all.filter(w => w.status === 'done').slice(0, 25), buildings: buildingsAll(), units: unitsAll() }));
 });
-get('/work/new', (req, res, ctx) => {
+get('/work/new', (req, res, ctx, token, q) => {
   const buildings = buildingsAll();
   if (!buildings.length) return redirect(res, '/units/new-building', { kind: 'warn', text: 'Add a building first.' });
-  html(res, V2.workForm(ctx, { w: null, buildings, units: unitsAll(), isNew: true }));
+  const pre = /^\d+$/.test(q.get('building') || '') ? { building_id: Number(q.get('building')), unit_id: '', title: '', notes: '', vendor: '', opened_at: L.todayISO(), cost: '', status: 'open' } : null;
+  if (pre) inBuilding(ctx, pre.building_id);
+  html(res, V2.workForm(ctx, { w: pre, buildings, units: unitsAll(), isNew: true }));
 });
 function workFromForm(f) {
   return { building_id: Number(f.building_id) || 0, unit_id: Number(f.unit_id) || null, title: S(f.title, 200), notes: S(f.notes, 2000), vendor: S(f.vendor, 120), opened_at: D(f.opened_at) || L.todayISO(), cost: N(f.cost), status: f.status === 'done' ? 'done' : 'open' };
@@ -398,6 +511,7 @@ post('/work/new', async (req, res, ctx) => {
 });
 get('/work/:id/edit', (req, res, ctx, token, q, p) => {
   const w = db.prepare('SELECT * FROM work_orders WHERE id = ?').get(p.id); if (!w) return notFound(req, res, ctx);
+  inBuilding(ctx, w.building_id);
   html(res, V2.workForm(ctx, { w, buildings: buildingsAll(), units: unitsAll(), isNew: false }));
 });
 post('/work/:id/edit', async (req, res, ctx, token, q, p) => {
@@ -444,7 +558,7 @@ function yearReport(year) {
   for (const r of db.prepare(`SELECT b.id, COALESCE(SUM(p.amount),0) v FROM payments p JOIN tenancies t ON t.id = p.tenancy_id JOIN units u ON u.id = t.unit_id JOIN buildings b ON b.id = u.building_id WHERE substr(p.date,1,4) = ? GROUP BY b.id`).all(y)) income[r.id] = r.v;
   for (const r of db.prepare(`SELECT building_id id, COALESCE(SUM(amount),0) v FROM expenses WHERE substr(date,1,4) = ? GROUP BY building_id`).all(y)) spent[r.id] = r.v;
   for (const r of db.prepare(`SELECT building_id id, COALESCE(SUM(amount),0) v FROM expenses WHERE substr(date,1,4) = ? AND category = 'Capital improvements' GROUP BY building_id`).all(y)) capital[r.id] = r.v;
-  const byBuilding = buildings.map(b => ({ id: b.id, name: b.name, income: L.round2(income[b.id] || 0), expenses: L.round2(spent[b.id] || 0), capital: L.round2(capital[b.id] || 0) }));
+  const byBuilding = buildings.map(b => ({ id: b.id, name: bname(b), income: L.round2(income[b.id] || 0), expenses: L.round2(spent[b.id] || 0), capital: L.round2(capital[b.id] || 0) }));
   const months = [];
   for (let m = 1; m <= 12; m++) months.push(L.monthSummary(`${y}-${String(m).padStart(2, '0')}`));
   const per = {};
@@ -461,7 +575,7 @@ get('/reports', (req, res, ctx, token, q) => {
 
 // ---------------------------------------------------------------- import
 get('/import', (req, res, ctx) => {
-  const recent = db.prepare('SELECT i.*, b.name AS building_name FROM imports i LEFT JOIN buildings b ON b.id = i.building_id ORDER BY i.id DESC LIMIT 20').all();
+  const recent = db.prepare("SELECT i.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name FROM imports i LEFT JOIN buildings b ON b.id = i.building_id ORDER BY i.id DESC LIMIT 20").all();
   html(res, V2.importPage(ctx, { recent }));
 });
 post('/api/import', async (req, res, ctx) => {
@@ -496,7 +610,7 @@ get('/api/export/building/:id', (req, res, ctx, token, q, p) => {
   const expenses = db.prepare(`SELECT e.*, u.label AS unit_label FROM expenses e LEFT JOIN units u ON u.id = e.unit_id WHERE e.building_id = ? AND substr(e.date,1,4) = ? ORDER BY e.date, e.id`).all(b.id, year);
   json(res, { building: b, year: Number(year), tenancies: tenancies.filter(t => t.status === 'active' || byT[t.id]).map(t => ({ ...t, months: Array.from({ length: 12 }, (_, i) => (byT[t.id] || {})[`${year}-${String(i + 1).padStart(2, '0')}`] || 0) })), expenses, categories: CATEGORIES });
 });
-get('/api/export/rentroll', (req, res) => json(res, { asOf: L.todayISO(), rows: L.unitBoard().flatMap(b => b.units.map(u => ({ building: b.name, address: b.address, unit: u.unit_label, kind: u.unit_kind, tenant: u.vacant ? '' : u.tenant_name, phone: u.phone || '', email: u.email || '', rent: u.vacant ? 0 : u.rent, deposit: u.vacant ? 0 : u.deposit, lease_start: u.lease_start || '', lease_end: u.lease_end || '', status: u.status, balance: u.balance || 0, last_payment: u.lastPayment ? u.lastPayment.date : '', last_method: u.lastPayment ? u.lastPayment.method : '' }))) }));
+get('/api/export/rentroll', (req, res) => json(res, { asOf: L.todayISO(), rows: L.unitBoard().flatMap(b => b.units.map(u => ({ building: bname(b), address: b.address, unit: u.unit_label, kind: u.unit_kind, tenant: u.vacant ? '' : u.tenant_name, phone: u.phone || '', email: u.email || '', rent: u.vacant ? 0 : u.rent, deposit: u.vacant ? 0 : u.deposit, lease_start: u.lease_start || '', lease_end: u.lease_end || '', status: u.status, balance: u.balance || 0, last_payment: u.lastPayment ? u.lastPayment.date : '', last_method: u.lastPayment ? u.lastPayment.method : '' }))) }));
 get('/api/export/delinquency', (req, res) => json(res, { asOf: L.todayISO(), rows: L.portfolioRows().filter(r => r.balance > 0).map(r => ({ tenant: r.tenant_name, building: r.building_name, unit: r.unit_label, phone: r.phone, rent: r.rent, owed: r.balance, unpaid_since: r.aging.oldest, days_late: r.aging.daysLate, current: r.aging.current, d30: r.aging.d30, d60: r.aging.d60, d90: r.aging.d90, last_payment: r.lastPayment ? r.lastPayment.date : '', last_amount: r.lastPayment ? r.lastPayment.amount : 0 })) }));
 get('/api/export/yearend', (req, res, ctx, token, q) => json(res, yearReport(/^\d{4}$/.test(q.get('year') || '') ? Number(q.get('year')) : new Date().getFullYear())));
 get('/api/export/expenses', (req, res, ctx, token, q) => json(res, { rows: expenseRowsFor({ year: /^\d{4}$/.test(q.get('year') || '') ? q.get('year') : '' }) }));
@@ -510,7 +624,10 @@ get('/backup.sqlite', (req, res) => {
 
 // ---------------------------------------------------------------- settings
 function settingsObj() { return { portfolio_name: getSetting('portfolio_name'), owner_name: getSetting('owner_name'), rent_due_day: getSetting('rent_due_day'), grace_days: getSetting('grace_days'), late_fee_kind: getSetting('late_fee_kind'), late_fee_amount: getSetting('late_fee_amount') }; }
-get('/settings', (req, res, ctx) => html(res, V2.settingsPage(ctx, settingsObj(), db.prepare('SELECT COUNT(*) c FROM buildings WHERE demo = 1').get().c)));
+get('/settings', (req, res, ctx) => html(res, V2.settingsPage(ctx, settingsObj(), db.prepare('SELECT COUNT(*) c FROM buildings WHERE demo = 1').get().c, {
+  configured: stripe.isConfigured(), testMode: stripe.isTestMode(), hasWebhook: !!getSetting('stripe_webhook_secret', ''), keyTail: (getSetting('stripe_secret_key', '') || '').slice(-4),
+  webhookUrl: `${pay.baseUrl(req)}/stripe/webhook`, pay_bank: getSetting('pay_bank', '1'), pay_card: getSetting('pay_card', '1'), pay_card_fee_to_tenant: getSetting('pay_card_fee_to_tenant', '1'),
+  recent: db.prepare(`SELECT o.*, t.tenant_name FROM online_payments o JOIN tenancies t ON t.id = o.tenancy_id ORDER BY o.created_at DESC LIMIT 10`).all() })));
 post('/settings', async (req, res, ctx) => {
   const f = parseForm(await readBody(req));
   setSetting('portfolio_name', S(f.portfolio_name, 80) || 'My properties');
@@ -534,6 +651,56 @@ get('/settings/clear-demo', (req, res, ctx) => html(res, V.confirmDelete(ctx, { 
 post('/settings/clear-demo', (req, res) => { const n = demo.clear(); redirect(res, '/settings', { text: `Cleared ${n} demo building(s).` }); });
 post('/settings/seed-demo', (req, res) => { demo.seed(); redirect(res, '/units', { text: 'Demo portfolio loaded.' }); });
 
+// ---------------------------------------------------------------- public: pay pages + webhook
+const payHits = new Map();
+function payThrottled(ip) {
+  const f = payHits.get(ip) || { t: Date.now(), n: 0 };
+  if (Date.now() - f.t > 60000) { f.t = Date.now(); f.n = 0; }
+  f.n++; payHits.set(ip, f);
+  return f.n > 60;
+}
+async function handlePublic(req, res, url) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?').split(',')[0].trim();
+  const portfolio = getSetting('portfolio_name', 'Rent');
+  if (url.pathname === '/stripe/webhook') {
+    if (req.method !== 'POST') return json(res, { error: 'POST only' }, 405);
+    const raw = (await readBody(req)).toString('utf8');
+    const secret = getSetting('stripe_webhook_secret', '');
+    if (!stripe.verifyWebhook(raw, req.headers['stripe-signature'], secret)) return json(res, { error: 'bad signature' }, 400);
+    let event; try { event = JSON.parse(raw); } catch (e) { return json(res, { error: 'bad json' }, 400); }
+    const result = pay.handleEvent(event);
+    console.log(`stripe ${event.type} ${event.id}: ${result}`);
+    return json(res, { received: true, result });
+  }
+  if (payThrottled(ip)) return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">Too many requests. Try again in a minute.</p>', 429);
+  const m = url.pathname.match(/^\/pay\/([A-Za-z0-9]{8,20})(?:\/(checkout|done))?$/);
+  if (!m) return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">This link is not valid.</p>', 404);
+  const t = pay.tenancyByToken(m[1]);
+  if (!t || t.status !== 'active') return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">This payment link is no longer active. Please contact your landlord.</p>', 404);
+  L.postRentCharges();
+  const configured = stripe.isConfigured();
+  if (!m[2] && req.method === 'GET') return html(res, pay.payPage(t, { portfolio, configured }), 200, { 'X-Robots-Tag': 'noindex' });
+  if (m[2] === 'checkout' && req.method === 'POST') {
+    const f = parseForm(await readBody(req));
+    const amount = N(f.amount);
+    try {
+      if (!configured) throw new Error('Online payments are not switched on yet.');
+      const session = await pay.startCheckout(req, t, amount, f.method === 'card' ? 'card' : 'bank');
+      res.writeHead(303, { Location: session.url }); return res.end();
+    } catch (e) {
+      console.error('checkout failed:', e.message);
+      return html(res, pay.payPage(t, { portfolio, configured, error: `Could not start the payment: ${e.message}` }), 400);
+    }
+  }
+  if (m[2] === 'done' && req.method === 'GET') {
+    const sid = url.searchParams.get('session_id') || '';
+    const op = /^cs_[A-Za-z0-9_]+$/.test(sid) ? await pay.syncSession(sid) : null;
+    if (op && op.tenancy_id !== t.id) return html(res, '<!doctype html><meta charset="utf-8"><p>Not found.</p>', 404);
+    return html(res, pay.donePage(t, op, { portfolio }));
+  }
+  return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">Not found.</p>', 404);
+}
+
 // ---------------------------------------------------------------- dispatch
 const OPEN = new Set(['/setup', '/login']);
 const server = http.createServer(async (req, res) => {
@@ -541,9 +708,18 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const pathname = url.pathname;
     if (req.method === 'GET' && (pathname === '/app.css' || pathname.startsWith('/js/'))) { if (serveStatic(req, res, pathname)) return; }
+    if (req.method === 'GET' && pathname.startsWith('/photos/')) {
+      const cookies0 = auth.parseCookies(req.headers.cookie);
+      if (!auth.sessionValid(cookies0[auth.COOKIE])) return redirect(res, '/login');
+      if (servePhoto(req, res, pathname.slice(8))) return;
+      return notFound(req, res, ctxFor(req, null));
+    }
     const cookies = auth.parseCookies(req.headers.cookie);
     const token = auth.sessionValid(cookies[auth.COOKIE]) ? cookies[auth.COOKIE] : null;
     if (pathname === '/health') return json(res, { ok: true });
+
+    // ---- tenant-facing, no login: pay pages and the Stripe webhook
+    if (pathname.startsWith('/pay/') || pathname === '/stripe/webhook') return handlePublic(req, res, url);
 
     if (!auth.isSetUp() && !OPEN.has(pathname)) return redirect(res, '/setup');
     if (!token && !OPEN.has(pathname)) return redirect(res, '/login');
@@ -566,8 +742,14 @@ const server = http.createServer(async (req, res) => {
       // CSRF for every POST except the JSON import endpoints, which check the token in their body.
       if (req.method === 'POST' && !pathname.startsWith('/api/')) {
         const buf = await readBody(req);
-        const f = parseForm(buf);
-        if (f._csrf !== ctx.csrf) return html(res, V.layout(ctx, { title: 'Expired', active: '', body: '<h1>That form expired</h1><p class="lede">Go back and try again.</p>' }), 403);
+        const isJson = /application\/json/.test(req.headers['content-type'] || '');
+        let tok = null;
+        if (isJson) { try { tok = JSON.parse(buf.toString('utf8'))._csrf; } catch (e) { tok = null; } }
+        else tok = parseForm(buf)._csrf;
+        if (tok !== ctx.csrf) {
+          if (isJson) return json(res, { ok: false, error: 'The page expired. Reload and try again.' }, 403);
+          return html(res, V.layout(ctx, { title: 'Expired', active: '', body: '<h1>That form expired</h1><p class="lede">Go back and try again.</p>' }), 403);
+        }
       }
       return await r.handler(req, res, ctx, token, url.searchParams, params);
     }

@@ -37,7 +37,9 @@ Once a month: **Export → Download backup**. Keep the file. It's your whole boo
 2. Stripe asks about your business. Answer as the entity that owns the buildings: your LLC's name and EIN, or your own name and SSN if you hold them personally. Add the bank account rent should land in.
 3. Stripe verifies you, usually within a day. You'll get an email when it's done.
 4. Once verified: in the Stripe dashboard, **Settings → Payments → Payment methods**, and turn on **ACH Direct Debit** (bank payments). It's off by default and it's the cheap one.
-5. Stop there. When Rollbook's online-payment update is ready, you'll paste two keys from Stripe into Rollbook's Settings page yourself. Ryan never needs them.
+5. In Rollbook: **Settings → Online payments**. From the Stripe dashboard, **Developers → API keys**, copy the **Secret key** and paste it in. Then **Developers → Webhooks → Add endpoint**: paste the Endpoint URL that Rollbook shows you, pick the four `checkout.session` events it lists, and copy the **Signing secret** into the second field. Click **Save and test the connection**. Ryan never needs these keys.
+6. Try it before telling tenants: Stripe has a **Test mode** switch; use its test secret key first (it starts with `sk_test_`), open one of your own pay links, and pay with Stripe's fake bank account (account `000123456789`, routing `110000000`). When it lands on the ledger, switch to the live key.
+7. Each tenant's private pay link is on their unit page. Text it or email it once; they can bookmark it.
 
 What it costs: nothing monthly. A bank payment costs 0.8% capped at $5, so a $3,500 rent costs $5. A card payment costs 2.9% plus 30¢ (about $102 on $3,500), which is why bank payments will be the default and cards optional. If a tenant's bank payment bounces, Stripe charges $4 for the failed attempt, the same way a bounced check costs you a fee.
 

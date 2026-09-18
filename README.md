@@ -15,7 +15,8 @@ Built for a portfolio of small buildings tracked today in per-building Excel wor
 - **Reports** — year at a glance: received vs. spent per building, month by month, and by category, with capital improvements broken out for the accountant.
 - **Import** — drop a workbook in the existing layout. It is read in the browser, previewed, and only saved when confirmed. Re-importing the same file adds nothing twice.
 - **Export** — the same building workbook layout (Income / Expenses / Summary / Receipts) filled from the ledger, plus rent roll, who-owes, year-end, and all-expenses spreadsheets. Built in the browser; nothing is sent anywhere.
-- **Backup** — download the whole database as one file.
+- **Buildings as places** — each building has its own page: photo, nickname, this month's numbers, unit board, recent payments, expenses, open work orders, leases ending. The side menu lists every building, with a red dot on any that has money owed.
+- **Backup** — download the whole database as one file. Building photos live beside it in `DATA_DIR/photos` and are not inside the backup file; keep the originals.
 - **Demo mode** — a fake three-building portfolio for showing the app; cleared with one button and never mixed with real buildings.
 
 ## Requirements
@@ -92,7 +93,9 @@ lib/ledger.js      rent posting, FIFO allocation, aging, balances
 lib/importer.js    writes a confirmed workbook into the ledger
 lib/auth.js        password, sessions, CSRF, login throttle
 lib/demo.js        the fake portfolio
-lib/views.js       page templates (part 1)
+lib/stripe.js      Stripe requests and webhook signature check (no SDK)
+lib/pay.js         tenant pay pages, Checkout sessions, webhook handling
+lib/views.js       page templates (part 1: layout, buildings, units, ledger)
 lib/views2.js      page templates (part 2)
 lib/util.js        escaping, money formatting, chart of accounts
 public/app.css     the design system
@@ -102,8 +105,21 @@ public/js/export.js  export page: builds .xlsx files with SheetJS
 test/run.js        end-to-end test over HTTP
 ```
 
+## Online payments (Stripe)
+
+Each active tenant has a private pay link (Unit page → Pay link → Copy, Text it, or Email it). The link shows their balance and recent payments and lets them pay by bank debit (ACH) or card on Stripe's hosted page. Card and bank details never touch this server.
+
+- **Setup:** Settings → Online payments. Paste the Stripe secret key (start with the test key), add a webhook endpoint in Stripe pointing at `https://<your app>/stripe/webhook` with the four `checkout.session.*` events listed on the page, and paste the signing secret. "Save and test the connection" confirms the key with Stripe.
+- **Fees:** bank debit is 0.8% capped at $5 (owner absorbs). Cards are 2.9% + 30¢; by default the fee is added to what the tenant pays so the owner nets the full rent. Both methods and the fee rule are switches in Settings.
+- **How money lands:** Stripe reports the result by webhook. Card payments post immediately. Bank debits show as "clearing" on the unit page and Who owes for 3–5 business days, then post; a failed debit is marked and nothing lands. Every webhook is signature-checked and idempotent, so a repeated event never double-posts.
+- **Links:** "New link" on the unit page retires the old one. Links stop working when the tenant is moved out.
+- Tenants get a receipt from Stripe when they have an email on file.
+- The Stripe keys are stored in the database, so a downloaded backup contains them. Keep backups where you would keep a bank statement.
+
+Testing without real money: use `sk_test_…` keys (the Settings page shows a *test mode* tag) and Stripe's test bank account `000123456789` / routing `110000000` or test card `4242 4242 4242 4242`.
+
 ## Not in this version
 
-Tenant-facing online payments, tenant maintenance requests, and text-message reminders. Those are the next phase and slot in without changing the ledger.
+Autopay (saved bank account drafted on the due day), tenant maintenance requests, and text-message reminders. Those are the next phases and slot in without changing the ledger.
 
 Built by NormalGuyAI.

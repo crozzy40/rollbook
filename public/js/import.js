@@ -133,7 +133,7 @@
         var s = r.summary;
         step2.innerHTML = '<h1>Saved</h1><p class="lede" style="margin:8px 0 18px">' + esc(s.building) + ' is in Rollbook: ' + s.tenants + ' tenant' + (s.tenants === 1 ? '' : 's') + ', ' + s.payments + ' payment' + (s.payments === 1 ? '' : 's') + ', ' + (s.expenses + s.receipts) + ' expense' + ((s.expenses + s.receipts) === 1 ? '' : 's') + '.</p>' +
           (s.warnings && s.warnings.length ? '<div class="notice warn"><ul>' + s.warnings.map(function (w) { return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></div>' : '') +
-          '<div class="actions"><a class="btn" href="/units#b' + r.buildingId + '">See the unit board</a><a class="btn secondary" href="/delinquency">Who owes</a><a class="btn secondary" href="/import">Import another building</a></div>';
+          '<div class="actions"><a class="btn" href="/buildings/' + r.buildingId + '">Open the building</a><a class="btn secondary" href="/delinquency">Who owes</a><a class="btn secondary" href="/import">Import another building</a></div>';
         window.scrollTo(0, 0);
       })
       .catch(function (e) { err.style.display = 'block'; err.textContent = 'Could not reach the server: ' + e.message; btn.disabled = false; btn.textContent = 'Save to Rollbook'; });
