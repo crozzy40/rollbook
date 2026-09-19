@@ -58,3 +58,15 @@ What it costs: nothing monthly. A bank payment costs 0.8% capped at $5, so a $3,
 - If the app ever shows "Something went wrong", reload. If it keeps happening, send Ryan the time it happened; the service's **Logs** tab in Render has the details.
 
 Rollbook was built for you by NormalGuyAI.
+
+## Part 5 — Reminders (optional, 10 minutes)
+
+Rollbook can text or email tenants when rent is due and when it is late, and send you a Monday morning summary. It sends nothing until you turn it on.
+
+1. **Email** is the free part. Sign up at **resend.com**, verify the domain you send from (they walk you through adding two DNS records; if you don't have a domain, skip email for now), then copy an API key.
+2. In Rollbook: **Reminders**. Paste the key, set "Send tenant email from" to an address on that domain, and put your own email in "Your email". Press **Test email to me**.
+3. Tick what you want: rent due, past due, the Monday summary, repair alerts. Set "Not before" to an hour you'd be comfortable a tenant received it.
+4. Press **Preview past due** before you trust it. It shows the exact messages, to the exact people, without sending anything.
+5. **Texting** is optional and costs a few dollars a month: a Twilio account, a phone number (about $1.15/month), and roughly a cent per message. Paste the account SID, auth token, and the number. Ask your tenants first — a phone number on a lease is not the same as permission to send automated texts.
+
+A tenant who should never be messaged: open their unit, **Edit tenant**, set Reminders to "Do not contact". Their pay link keeps working.

@@ -61,6 +61,21 @@ function fixtureSheets(year) {
 const http = require('node:http');
 const STRIPE_PORT = PORT + 1;
 const sessions = {};
+const mailbox = [], texts = [];
+const MAIL_PORT = PORT + 2, SMS_PORT = PORT + 3;
+const mailMock = http.createServer((req, res) => {
+  let b = ''; req.on('data', c => b += c); req.on('end', () => {
+    if (!/^Bearer re_ok/.test(req.headers.authorization || '')) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ message: 'API key is invalid' })); }
+    const j = JSON.parse(b); mailbox.push(j);
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ id: 'email_' + mailbox.length }));
+  });
+});
+const smsMock = http.createServer((req, res) => {
+  let b = ''; req.on('data', c => b += c); req.on('end', () => {
+    const q = Object.fromEntries(new URLSearchParams(b)); texts.push(q);
+    res.writeHead(201, { 'content-type': 'application/json' }); res.end(JSON.stringify({ sid: 'SM' + texts.length }));
+  });
+});
 const stripeMock = http.createServer((req, res) => {
   let body = ''; req.on('data', c => body += c); req.on('end', () => {
     const auth = req.headers.authorization || '';
@@ -80,7 +95,9 @@ const stripeMock = http.createServer((req, res) => {
 
 (async () => {
   await new Promise(r => stripeMock.listen(STRIPE_PORT, r));
-  const server = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(PORT), DATA_DIR, STRIPE_API_BASE: `http://localhost:${STRIPE_PORT}` }, stdio: ['ignore', 'pipe', 'pipe'] });
+  await new Promise(r => mailMock.listen(MAIL_PORT, r));
+  await new Promise(r => smsMock.listen(SMS_PORT, r));
+  const server = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(PORT), DATA_DIR, STRIPE_API_BASE: `http://localhost:${STRIPE_PORT}`, RESEND_API_BASE: `http://localhost:${MAIL_PORT}`, TWILIO_API_BASE: `http://localhost:${SMS_PORT}`, ROLLBOOK_NO_SCHEDULER: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
   let serverLog = '';
   server.stdout.on('data', d => serverLog += d); server.stderr.on('data', d => serverLog += d);
   for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/health'); break; } catch (e) { await new Promise(r => setTimeout(r, 100)); } }
@@ -422,8 +439,111 @@ const stripeMock = http.createServer((req, res) => {
       const f2 = await get(`/pay/${newToken}/fix`); assert.match(f2.text, /\(312\) 555-0100/);
       cookie = saved;
     });
+    // ---- Phase 4: reminders
+    const notifySave = (over = {}) => follow('/settings/notify', { resend_key: 're_ok123', from_email: 'rent@example.com', owner_email: 'owner@example.com', owner_phone: '(312) 555-0100',
+      twilio_sid: 'ACtest', twilio_token: 'tok', twilio_from: '+13125550111', sign_off: '— Jane', app_url: BASE, notify_email: '1', notify_sms: '1',
+      notify_due: '1', notify_late: '1', notify_digest: '1', notify_reports: '1', notify_reports_when: 'urgent', notify_hour: '0', ...over });
+    async function preview(force) { const r = await post('/messages/run', { force, preview: '1' }); assert.equal(r.status, 200, 'preview renders a page'); return r; }
+    await test('tenants get contact details so reminders have somewhere to go', async () => {
+      for (const [label, email, phone] of [['2', 'bob@example.com', '3125550122'], ['Garage', 'gary@example.com', '3125550155']]) {
+        if (!unitIds[label]) continue;
+        const u = await get(`/units/${unitIds[label]}`); const tid = (u.text.match(/\/tenancies\/(\d+)\/edit/) || [])[1]; if (!tid) continue;
+        const f = await get(`/tenancies/${tid}/edit`);
+        const g = n => (f.text.match(new RegExp(`name="${n}" value="([^"]*)"`)) || ['', ''])[1];
+        await follow(`/tenancies/${tid}/edit`, { tenant_name: g('tenant_name'), phone, email, rent: g('rent'), deposit: g('deposit'), lease_start: g('lease_start'), lease_end: g('lease_end'), charges_from: g('charges_from'), notes: '', notify: 'both' });
+      }
+      // Give Bob an unpaid charge from three weeks ago so there is something to remind him about.
+      const u2 = await get(`/units/${unitIds['2']}`); const tid2b = u2.text.match(/\/tenancies\/(\d+)\/charges/)[1];
+      const old = new Date(Date.now() - 21 * 86400000).toISOString().slice(0, 10);
+      await follow(`/tenancies/${tid2b}/charges`, { kind: 'other', amount: '3000', date: old, memo: 'Broken window' });
+      const r = await get(`/units/${unitIds['2']}`); assert.match(r.text, /bob@example\.com/); assert.match(r.text, /Broken window/);
+      const d = await get('/delinquency'); assert.match(d.text, new RegExp(`href="/units/${unitIds['2']}"`), 'he now owes, so reminders have a target');
+    });
+    await test('reminders page saves the settings and a test message reaches the owner', async () => {
+      let r = await get('/messages'); assert.match(r.text, /No way to send yet/);
+      r = await notifySave(); assert.match(r.text, /Saved/); assert.doesNotMatch(r.text, /No way to send yet/);
+      const before = mailbox.length;
+      r = await follow('/messages/test', { channel: 'email' }); assert.match(r.text, /Test email sent to owner@example\.com/);
+      assert.equal(mailbox.length, before + 1); assert.equal(mailbox[mailbox.length - 1].to[0], 'owner@example.com');
+      r = await follow('/messages/test', { channel: 'sms' }); assert.match(r.text, /Test text sent/);
+      assert.equal(texts[texts.length - 1].To, '+13125550100', 'phone normalised to E.164');
+      assert.match(r.text, /Sent/, 'the log shows it');
+    });
+    await test('a bad email key is reported, not swallowed', async () => {
+      await notifySave({ resend_key: 're_bad' });
+      const r = await follow('/messages/test', { channel: 'email' }); assert.match(r.text, /Could not send: API key is invalid/);
+      const log = await get('/messages'); assert.match(log.text, /Failed/);
+      await notifySave();
+    });
+    await test('preview shows what would go out without sending', async () => {
+      const before = mailbox.length;
+      const r = await preview('due');
+      assert.match(r.text, /would go out right now/); assert.match(r.text, /Rent due today/); assert.match(r.text, /\/pay\//, 'the pay link is in the message');
+      assert.equal(mailbox.length, before, 'nothing sent on a preview');
+    });
+    await test('rent-due notices go to tenants with a balance, once each, on both channels', async () => {
+      const before = mailbox.length, beforeT = texts.length;
+      let r = await follow('/messages/run', { force: 'due' }); assert.match(r.text, /\d+ sent/);
+      const sentTo = mailbox.slice(before).map(m => m.to[0]);
+      assert.ok(sentTo.includes('bob@example.com'), 'the tenant who owes was emailed'); assert.ok(texts.length > beforeT, 'and texted');
+      assert.match(mailbox[mailbox.length - 1].text, /— Jane/, 'sign-off included');
+      const again = mailbox.length;
+      r = await follow('/messages/run', { force: 'due' }); assert.match(r.text, /already sent/);
+      assert.equal(mailbox.length, again, 'a second run sends nothing');
+    });
+    await test('past-due notices only go to tenants past the grace period', async () => {
+      const before = mailbox.length;
+      await follow('/messages/run', { force: 'late' });
+      const sent = mailbox.slice(before);
+      assert.ok(sent.length >= 1); assert.ok(sent.every(m => /past due/i.test(m.subject)), 'all are past-due notices');
+      assert.ok(sent.every(m => /days past due/.test(m.text)));
+    });
+    await test('a tenant set to "do not contact" is left alone', async () => {
+      const u = await get(`/units/${unitIds['2']}`); const tid = u.text.match(/\/tenancies\/(\d+)\/edit/)[1];
+      const f = await get(`/tenancies/${tid}/edit`);
+      const g = n => (f.text.match(new RegExp(`name="${n}" value="([^"]*)"`)) || ['', ''])[1];
+      const fields = { tenant_name: g('tenant_name'), phone: g('phone'), email: g('email'), rent: g('rent'), deposit: g('deposit'), lease_start: g('lease_start'), lease_end: g('lease_end'), charges_from: g('charges_from'), notes: '' };
+      let r = await preview('late'); assert.match(r.text, /bob@example\.com/, 'in the plan to start with');
+      await follow(`/tenancies/${tid}/edit`, { ...fields, notify: 'off' });
+      r = await preview('late'); assert.doesNotMatch(r.text, /bob@example\.com/, 'opted out, so out of the plan');
+      await follow(`/tenancies/${tid}/edit`, { ...fields, notify: 'email' });
+      r = await preview('late'); assert.match(r.text, /bob@example\.com/); assert.doesNotMatch(r.text, /\+13125550122/, 'email only means no text');
+      await follow(`/tenancies/${tid}/edit`, { ...fields, notify: 'both' });
+    });
+    await test('the Monday summary lists who owes, repairs and leases', async () => {
+      const r = await preview('digest');
+      assert.match(r.text, /owner@example\.com/); assert.match(r.text, /Collected in the last 7 days/); assert.match(r.text, /Owed right now/);
+      assert.match(r.text, /Open repairs/); assert.match(r.text, /delinquency/);
+    });
+    await test('an urgent tenant report alerts the owner by email and text', async () => {
+      const u = await get(`/units/${unitIds['Garage']}`); const tok4 = u.text.match(/value="http[^"]+\/pay\/([A-Za-z0-9]+)"/)[1];
+      const beforeM = mailbox.length, beforeT = texts.length;
+      const saved = cookie; cookie = '';
+      await fetch(BASE + `/pay/${tok4}/fix`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Water coming through the ceiling', urgency: 'emergency', notes: 'Bedroom, getting worse' }) });
+      cookie = saved;
+      await new Promise(r => setTimeout(r, 400));
+      const mail = mailbox.slice(beforeM).find(m => /EMERGENCY/.test(m.subject || ''));
+      assert.ok(mail, 'owner emailed'); assert.match(mail.text, /Water coming through the ceiling/); assert.match(mail.text, /Their number/);
+      assert.ok(texts.length > beforeT, 'owner texted for an emergency');
+    });
+    await test('a routine report does not alert when set to urgent only', async () => {
+      const u = await get(`/units/${unitIds['Garage']}`); const tok4 = u.text.match(/value="http[^"]+\/pay\/([A-Za-z0-9]+)"/)[1];
+      const beforeM = mailbox.length;
+      const saved = cookie; cookie = '';
+      await fetch(BASE + `/pay/${tok4}/fix`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Cabinet door loose', urgency: 'normal' }) });
+      cookie = saved;
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(mailbox.length, beforeM, 'nothing sent for a routine report');
+    });
+    await test('switching everything off sends nothing', async () => {
+      await notifySave({ notify_due: '0', notify_late: '0', notify_digest: '0', notify_reports: '0' });
+      const before = mailbox.length;
+      const r = await follow('/messages/run', {});
+      assert.match(r.text, /0 sent/); assert.equal(mailbox.length, before);
+      await notifySave();
+    });
   } finally {
-    server.kill(); stripeMock.close();
+    server.kill(); stripeMock.close(); mailMock.close(); smsMock.close();
     fs.rmSync(DATA_DIR, { recursive: true, force: true });
   }
   console.log(`\n${passed} passed, ${failed} failed`);

@@ -96,6 +96,8 @@ lib/demo.js        the fake portfolio
 lib/stripe.js      Stripe requests and webhook signature check (no SDK)
 lib/pay.js         tenant pay pages, Checkout sessions, webhooks, repair requests
 lib/photos.js      resized photo storage for repairs and buildings
+lib/notify.js      email (Resend) and text (Twilio) sending, with a message log
+lib/tasks.js       which reminders are due, what they say, and the timer
 lib/views.js       page templates (part 1: layout, buildings, units, ledger)
 lib/views2.js      page templates (part 2)
 lib/util.js        escaping, money formatting, chart of accounts
@@ -130,8 +132,27 @@ The same private link carries a **Report a repair** form: what is wrong, any det
 
 Photos live in `DATA_DIR/photos` beside the database, not inside it, so a backup file does not contain them. Viewing one requires a login.
 
+## Reminders
+
+Reminders page. Everything is off until switched on, and nothing sends without a way to send it.
+
+- **Rent due today** on the due day, to anyone carrying a balance, with their pay link.
+- **Past due**, once per tenant per month, after the grace period, naming the balance, the days late and the late fee that may apply.
+- **Monday summary** to the owner: collected in the last seven days, who owes with days late, open repairs, leases ending within sixty days, and a link to the delinquency report.
+- **Repair alerts** when a tenant reports something: email always, and a text as well for urgent and emergencies. "Only urgent" or "every one" is a setting.
+
+Email goes through Resend (free tier covers a portfolio this size; needs a verified sending domain). Texts are optional and go through Twilio. Either can be left blank. A "not before" hour keeps messages out of the middle of the night, and per-tenant preference (email, text, both, do not contact) is on the tenant's own record.
+
+Every message is written to the log first with a dedupe key, so the same reminder cannot go twice however often the scheduler runs. The scheduler is a timer inside the app, every fifteen minutes; there is no separate cron service to pay for. **Preview** shows exactly who would get what, rendered, without sending; **Test** sends one message to the owner only.
+
+Consent: a tenant who gave a phone number for their lease has not necessarily agreed to automated texts. Ask before switching texting on, and note that Twilio handles STOP replies.
+
 ## Not in this version
 
-Autopay (saved bank account drafted on the due day) and text-message reminders. Those are the next phases and slot in without changing the ledger.
+Autopay (saved bank account drafted on the due day), lease documents and deposit tracking, and the Schedule E export. Those are the next phases and slot in without changing the ledger.
+
+## License
+
+Proprietary; all rights reserved. See `LICENSE`. The owner this was built for has a perpetual, irrevocable right to run her own copy and owns all data in it. Published publicly only so that copy can be deployed from here.
 
 Built by NormalGuyAI.

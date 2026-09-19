@@ -14,6 +14,8 @@ const importer = require('./lib/importer');
 const demo = require('./lib/demo');
 const pay = require('./lib/pay');
 const photos = require('./lib/photos');
+const notify = require('./lib/notify');
+const tasks = require('./lib/tasks');
 const stripe = require('./lib/stripe');
 const V = require('./lib/views');
 const V2 = require('./lib/views2');
@@ -326,7 +328,8 @@ get('/units/:id/move-in', (req, res, ctx, token, q, p) => {
 });
 function tenancyFromForm(f) {
   return { tenant_name: S(f.tenant_name, 120), phone: S(f.phone, 40), email: S(f.email, 120), rent: N(f.rent), deposit: N(f.deposit),
-    lease_start: D(f.lease_start), lease_end: D(f.lease_end), charges_from: M(f.charges_from) || L.currentPeriod(), notes: S(f.notes, 2000) };
+    lease_start: D(f.lease_start), lease_end: D(f.lease_end), charges_from: M(f.charges_from) || L.currentPeriod(), notes: S(f.notes, 2000),
+    notify: ['both', 'email', 'sms', 'off'].includes(f.notify) ? f.notify : 'both' };
 }
 post('/units/:id/move-in', async (req, res, ctx, token, q, p) => {
   const unit = unitById(p.id); if (!unit) return notFound(req, res, ctx);
@@ -334,8 +337,8 @@ post('/units/:id/move-in', async (req, res, ctx, token, q, p) => {
   const t = tenancyFromForm(parseForm(await readBody(req)));
   if (!t.tenant_name) return redirect(res, `/units/${unit.id}/move-in`, { kind: 'error', text: 'Tenant needs a name.' });
   if (t.charges_from > L.currentPeriod()) t.charges_from = L.currentPeriod();
-  db.prepare(`INSERT INTO tenancies(unit_id,tenant_name,phone,email,rent,deposit,lease_start,lease_end,lease_text,charges_from,status,notes,created_at) VALUES (?,?,?,?,?,?,?,?,'',?,'active',?,?)`)
-    .run(unit.id, t.tenant_name, t.phone, t.email, t.rent, t.deposit, t.lease_start, t.lease_end, t.charges_from, t.notes, now());
+  db.prepare(`INSERT INTO tenancies(unit_id,tenant_name,phone,email,rent,deposit,lease_start,lease_end,lease_text,charges_from,status,notes,created_at,notify) VALUES (?,?,?,?,?,?,?,?,'',?,'active',?,?,?)`)
+    .run(unit.id, t.tenant_name, t.phone, t.email, t.rent, t.deposit, t.lease_start, t.lease_end, t.charges_from, t.notes, now(), t.notify);
   L.postRentCharges();
   redirect(res, `/units/${unit.id}`, { text: `${t.tenant_name} moved in. Rent is on the ledger.` });
 });
@@ -350,8 +353,8 @@ post('/tenancies/:id/edit', async (req, res, ctx, token, q, p) => {
   if (!t.tenant_name) return redirect(res, `/tenancies/${t0.id}/edit`, { kind: 'error', text: 'Tenant needs a name.' });
   if (t.charges_from > L.currentPeriod()) t.charges_from = L.currentPeriod();
   transaction(() => {
-    db.prepare('UPDATE tenancies SET tenant_name=?, phone=?, email=?, rent=?, deposit=?, lease_start=?, lease_end=?, charges_from=?, notes=? WHERE id = ?')
-      .run(t.tenant_name, t.phone, t.email, t.rent, t.deposit, t.lease_start, t.lease_end, t.charges_from, t.notes, t0.id);
+    db.prepare('UPDATE tenancies SET tenant_name=?, phone=?, email=?, rent=?, deposit=?, lease_start=?, lease_end=?, charges_from=?, notes=?, notify=? WHERE id = ?')
+      .run(t.tenant_name, t.phone, t.email, t.rent, t.deposit, t.lease_start, t.lease_end, t.charges_from, t.notes, t.notify, t0.id);
     // Rent changed: update this month's and future unpaid rent charges to the new amount; history is left alone.
     if (t.rent !== t0.rent) db.prepare(`UPDATE charges SET amount = ? WHERE tenancy_id = ? AND kind = 'rent' AND period >= ?`).run(t.rent, t0.id, L.currentPeriod());
     // charges_from moved earlier: remove nothing, just let posting fill in. Moved later: drop rent charges before it that have no payment attached.
@@ -437,6 +440,61 @@ post('/settings/stripe', async (req, res, ctx) => {
   } catch (e) {
     redirect(res, '/settings#online', { kind: 'error', text: `Saved, but Stripe rejected the key: ${e.message}` });
   }
+});
+
+// ---------------------------------------------------------------- reminders
+get('/messages', (req, res, ctx, token, q) => {
+  const rows = db.prepare(`SELECT m.*, t.tenant_name FROM messages m LEFT JOIN tenancies t ON t.id = m.tenancy_id ORDER BY m.id DESC LIMIT 100`).all();
+  html(res, V2.messagesPage(ctx, { rows, state: notifyState(req) }));
+});
+function notifyState(req) {
+  return {
+    emailReady: notify.emailReady(), smsReady: notify.smsReady(),
+    from_email: getSetting('from_email', ''), owner_email: getSetting('owner_email', ''), owner_phone: getSetting('owner_phone', ''),
+    resend_tail: (getSetting('resend_key', '') || '').slice(-4), twilio_sid: getSetting('twilio_sid', ''), twilio_from: getSetting('twilio_from', ''),
+    notify_email: getSetting('notify_email', '1'), notify_sms: getSetting('notify_sms', '0'),
+    notify_due: getSetting('notify_due', '0'), notify_late: getSetting('notify_late', '0'), notify_digest: getSetting('notify_digest', '0'),
+    notify_reports: getSetting('notify_reports', '1'), notify_reports_when: getSetting('notify_reports_when', 'urgent'),
+    notify_hour: getSetting('notify_hour', '9'), sign_off: getSetting('sign_off', ''), app_url: getSetting('app_url', '') || pay.baseUrl(req),
+    rent_due_day: getSetting('rent_due_day', '1'), grace_days: getSetting('grace_days', '5'),
+  };
+}
+post('/settings/notify', async (req, res, ctx) => {
+  const f = parseForm(await readBody(req));
+  const key = S(f.resend_key, 200), sid = S(f.twilio_sid, 80), tok = S(f.twilio_token, 200);
+  if (key) setSetting('resend_key', key); else if (f.clear_email === '1') setSetting('resend_key', '');
+  if (sid) setSetting('twilio_sid', sid);
+  if (tok) setSetting('twilio_token', tok);
+  if (f.clear_sms === '1') { setSetting('twilio_sid', ''); setSetting('twilio_token', ''); setSetting('twilio_from', ''); }
+  else setSetting('twilio_from', S(f.twilio_from, 30));
+  setSetting('from_email', S(f.from_email, 120));
+  setSetting('owner_email', S(f.owner_email, 120));
+  setSetting('owner_phone', S(f.owner_phone, 40));
+  setSetting('sign_off', S(f.sign_off, 200));
+  const appUrl = S(f.app_url, 200).replace(/\/+$/, '');
+  if (/^https?:\/\/[^\s]+$/.test(appUrl) || appUrl === '') setSetting('app_url', appUrl);
+  for (const k of ['notify_email', 'notify_sms', 'notify_due', 'notify_late', 'notify_digest', 'notify_reports']) setSetting(k, f[k] === '1' ? '1' : '0');
+  setSetting('notify_reports_when', f.notify_reports_when === 'all' ? 'all' : 'urgent');
+  setSetting('notify_hour', String(Math.min(23, Math.max(0, Number(f.notify_hour) || 9))));
+  redirect(res, '/messages', { text: 'Saved.' });
+});
+post('/messages/test', async (req, res, ctx) => {
+  const f = parseForm(await readBody(req));
+  const ch = f.channel === 'sms' ? 'sms' : 'email';
+  const to = ch === 'sms' ? getSetting('owner_phone', '') : getSetting('owner_email', '');
+  if (!to) return redirect(res, '/messages', { kind: 'error', text: `Add your own ${ch === 'sms' ? 'phone number' : 'email address'} first.` });
+  const out = await notify.deliver({ kind: 'test', dedupeKey: null, channel: ch, to, subject: 'Rollbook test message', text: 'This is a test from Rollbook. If you are reading this, reminders can reach you.' });
+  redirect(res, '/messages', out.sent ? { text: `Test ${ch === 'sms' ? 'text' : 'email'} sent to ${to}.` } : { kind: 'error', text: `Could not send: ${out.error}` });
+});
+post('/messages/run', async (req, res, ctx) => {
+  const f = parseForm(await readBody(req));
+  const force = ['due', 'late', 'digest'].includes(f.force) ? f.force : null;
+  const dryRun = f.preview === '1';
+  const out = await tasks.runDue({ force, dryRun });
+  if (dryRun) {
+    return html(res, V2.previewPage(ctx, out.planned, force));
+  }
+  redirect(res, '/messages', { text: `${out.sent} sent, ${out.skipped} already sent, ${out.failed} failed.` });
 });
 
 // ---------------------------------------------------------------- expenses
@@ -719,6 +777,8 @@ async function handlePublic(req, res, url) {
       if (pay.tooManyRequests(t.id)) return json(res, { ok: false, error: 'You have several repairs open already. Please call your landlord about anything urgent.' }, 429);
       const out = pay.createRequest(t, { title, notes: S(body.notes, 1200), urgency: S(body.urgency, 20), photoData: Array.isArray(body.photos) ? body.photos : [] });
       console.log(`repair reported: ${title} (unit ${t.unit_label}, ${out.photos} photo(s))`);
+      const wo = db.prepare('SELECT * FROM work_orders WHERE id = ?').get(out.id);
+      tasks.alertOwner(wo, t, bname(t)).catch(e => console.error('owner alert failed:', e.message));
       return json(res, { ok: true, id: out.id });
     }
   }
@@ -770,6 +830,7 @@ const server = http.createServer(async (req, res) => {
     // Post any rent that has come due since the last visit.
     if (token && req.method === 'GET') L.postRentCharges();
 
+    if (token && !getSetting('app_url', '')) { const b = pay.baseUrl(req); if (/^https?:\/\//.test(b) && !/localhost/.test(b)) setSetting('app_url', b); }
     const ctx = ctxFor(req, token);
     if (cookies.rollbook_flash) {
       try { ctx.flash = JSON.parse(decodeURIComponent(cookies.rollbook_flash)); } catch (e) { }
@@ -802,4 +863,7 @@ const server = http.createServer(async (req, res) => {
     res.end('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:40px"><h1>Something went wrong</h1><p>Rollbook hit an error. Reload the page; if it keeps happening, the details are in the server log.</p>');
   }
 });
-server.listen(PORT, () => console.log(`Rollbook listening on http://localhost:${PORT}  (data: ${DB_PATH})`));
+server.listen(PORT, () => {
+  console.log(`Rollbook listening on http://localhost:${PORT}  (data: ${DB_PATH})`);
+  tasks.start();
+});
