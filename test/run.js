@@ -343,6 +343,85 @@ const stripeMock = http.createServer((req, res) => {
       await follow(`/tenancies/${t3}/move-out`, { move_out: `${cur}-28` });
       cookie = ''; const gone = await get(`/pay/${tok3}`); cookie = saved; assert.equal(gone.status, 404);
     });
+    // ---- Phase 3: tenant repair requests
+    const jpgData = 'data:image/jpeg;base64,' + Buffer.from('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64').toString('base64');
+    let newToken, woId;
+    await test('tenant link offers a repair report when the setting is on', async () => {
+      const u = await get(`/units/${unitIds['2']}`); newToken = u.text.match(/value="http[^"]+\/pay\/([A-Za-z0-9]+)"/)[1];
+      const saved = cookie; cookie = '';
+      const r = await get(`/pay/${newToken}`); assert.match(r.text, /Something need fixing\?/); assert.match(r.text, /href="\/pay\/[A-Za-z0-9]+\/fix"/);
+      const f = await get(`/pay/${newToken}/fix`); assert.equal(f.status, 200); assert.match(f.text, /What is wrong\?/); assert.match(f.text, /Emergency/);
+      cookie = saved;
+    });
+    async function report(body) { const saved = cookie; cookie = ''; const r = await fetch(BASE + `/pay/${newToken}/fix`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); cookie = saved; return { status: r.status, json: await r.json() }; }
+    await test('a report with no title is refused', async () => { const r = await report({ title: '  ', notes: 'x' }); assert.equal(r.status, 400); assert.match(r.json.error, /what is wrong/i); });
+    await test('tenant reports a repair with photos; it lands as a work order', async () => {
+      const r = await report({ title: 'Kitchen sink leaking', notes: 'Started last night, bucket under it', urgency: 'urgent', photos: [jpgData, jpgData] });
+      assert.equal(r.json.ok, true); woId = r.json.id;
+      const w = await get('/work'); assert.match(w.text, /Kitchen sink leaking/); assert.match(w.text, /from Bob/); assert.match(w.text, /Soon<\/span>/);
+      const imgs = w.text.match(/\/photos\/[a-f0-9]{24}\.jpg/g) || []; assert.ok(imgs.length >= 2, 'two photos shown');
+      const img = await fetch(BASE + imgs[0], { headers: { cookie } }); assert.equal(img.status, 200); assert.equal(img.headers.get('content-type'), 'image/jpeg');
+      const anon = await fetch(BASE + imgs[0], { redirect: 'manual' }); assert.equal(anon.status, 303, 'photos need a login');
+    });
+    await test('a bad photo is dropped, the report still lands', async () => {
+      const r = await report({ title: 'Front door sticks', photos: ['data:image/png;base64,AAAA', 'not a data url'] });
+      assert.equal(r.json.ok, true);
+      const e = await get(`/work/${r.json.id}/edit`); assert.match(e.text, /Front door sticks/); assert.doesNotMatch(e.text, /thumbs big/);
+    });
+    await test('emergency reports sort to the top and are flagged', async () => {
+      await report({ title: 'No heat at all', urgency: 'emergency' });
+      const w = await get('/work'); const rows = [...w.text.matchAll(/<td>(?:<span class="chip"[^>]*>([^<]*)<\/span> )?([^<]{4,40})</g)].map(m => m[2]);
+      assert.match(w.text, /class="hot"/); assert.ok(w.text.indexOf('No heat at all') < w.text.indexOf('Kitchen sink leaking'), 'emergency first');
+    });
+    await test('the owner sees a badge for unread reports, cleared by opening the page', async () => {
+      await get('/work'); // start from a clean slate
+      let home = await get('/'); assert.doesNotMatch(home.text, /Work orders<span class="count">/);
+      await report({ title: 'Buzzer not working' });
+      home = await get('/'); assert.match(home.text, /Work orders<span class="count">1<\/span>/, 'badge appears for a new tenant report');
+      await get('/work');
+      home = await get('/'); assert.doesNotMatch(home.text, /Work orders<span class="count">/);
+    });
+    await test('tenant sees status and the note the owner wrote', async () => {
+      await get(`/work/${woId}/edit`);
+      let r = await follow(`/work/${woId}/edit`, { building_id: importResult.buildingId, unit_id: unitIds['2'], title: 'Kitchen sink leaking', notes: 'x', vendor: 'Plumber', opened_at: `${cur}-02`, cost: '', status: 'open', urgency: 'urgent', tenant_note: 'Plumber coming Thursday' });
+      const saved = cookie; cookie = '';
+      r = await get(`/pay/${newToken}`); assert.match(r.text, /Kitchen sink leaking/); assert.match(r.text, /Plumber coming Thursday/); assert.match(r.text, /Reported/);
+      cookie = saved;
+      r = await get(`/work/${woId}/done`); assert.match(r.text, /Note the tenant sees/);
+      r = await follow(`/work/${woId}/done`, { cost: '180', category: 'Repairs & maintenance', closed_at: `${cur}-05`, add_expense: '1', tenant_note: 'Fixed, new faucet' }); assert.match(r.text, /\$180\.00 logged to expenses/);
+      cookie = '';
+      r = await get(`/pay/${newToken}`); assert.match(r.text, /Fixed, new faucet/); assert.match(r.text, /status paid">Fixed/);
+      cookie = saved;
+    });
+    await test('deleting a work order deletes its photos from disk', async () => {
+      const e = await get(`/work/${woId}/edit`); const file = (e.text.match(/\/photos\/([a-f0-9]{24}\.jpg)/) || [])[1];
+      assert.ok(file, 'photo present before delete');
+      await follow(`/work/${woId}/delete`, {});
+      const img = await fetch(BASE + '/photos/' + file, { headers: { cookie }, redirect: 'manual' }); assert.equal(img.status, 404, 'file gone');
+    });
+    await test('flood protection: a tenant cannot open unlimited reports', async () => {
+      for (let i = 0; i < 5; i++) await report({ title: 'Spam report ' + i });
+      const r = await report({ title: 'One too many' }); assert.equal(r.status, 429); assert.match(r.json.error, /call your landlord/);
+    });
+    await test('saving rent rules leaves the repair-request switches alone', async () => {
+      await get('/settings');
+      await follow('/settings', { section: 'requests', requests_on: '1', emergency_phone: '(312) 555-0199' });
+      await follow('/settings', { section: 'rules', portfolio_name: 'Test Props', owner_name: 'Test Owner', rent_due_day: '1', grace_days: '5', late_fee_kind: 'percent', late_fee_amount: '5' });
+      const r = await get('/settings'); assert.match(r.text, /name="requests_on" value="1" checked/); assert.match(r.text, /\(312\) 555-0199/);
+    });
+    await test('turning requests off hides the form and refuses posts', async () => {
+      await get('/settings');
+      await follow('/settings', { section: 'requests', requests_on: '0', emergency_phone: '' });
+      const saved = cookie; cookie = '';
+      const r = await get(`/pay/${newToken}`); assert.doesNotMatch(r.text, /Something need fixing/);
+      const f = await fetch(BASE + `/pay/${newToken}/fix`, { redirect: 'manual' }); assert.equal(f.status, 303);
+      cookie = saved;
+      await get('/settings');
+      await follow('/settings', { section: 'requests', requests_on: '1', emergency_phone: '(312) 555-0100' });
+      cookie = '';
+      const f2 = await get(`/pay/${newToken}/fix`); assert.match(f2.text, /\(312\) 555-0100/);
+      cookie = saved;
+    });
   } finally {
     server.kill(); stripeMock.close();
     fs.rmSync(DATA_DIR, { recursive: true, force: true });

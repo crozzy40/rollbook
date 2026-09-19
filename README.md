@@ -94,7 +94,8 @@ lib/importer.js    writes a confirmed workbook into the ledger
 lib/auth.js        password, sessions, CSRF, login throttle
 lib/demo.js        the fake portfolio
 lib/stripe.js      Stripe requests and webhook signature check (no SDK)
-lib/pay.js         tenant pay pages, Checkout sessions, webhook handling
+lib/pay.js         tenant pay pages, Checkout sessions, webhooks, repair requests
+lib/photos.js      resized photo storage for repairs and buildings
 lib/views.js       page templates (part 1: layout, buildings, units, ledger)
 lib/views2.js      page templates (part 2)
 lib/util.js        escaping, money formatting, chart of accounts
@@ -118,8 +119,19 @@ Each active tenant has a private pay link (Unit page → Pay link → Copy, Text
 
 Testing without real money: use `sk_test_…` keys (the Settings page shows a *test mode* tag) and Stripe's test bank account `000123456789` / routing `110000000` or test card `4242 4242 4242 4242`.
 
+## Repair requests from tenants
+
+The same private link carries a **Report a repair** form: what is wrong, any detail, how soon, and up to four photos. Photos are resized on the tenant's phone before sending; nothing else is uploaded.
+
+- A report lands as an open work order tagged with the tenant's name, its urgency, and the photos. Emergencies sort to the top of Work orders with a red band, and the side menu shows a count until the owner opens the page.
+- The owner can type a short **note the tenant sees** ("Plumber coming Thursday"), which appears beside that repair on the tenant's link. Marking the repair done flips it to Fixed there, and the cost can post to Expenses in the same step.
+- Settings → Repair requests turns the form on or off and holds an emergency phone number, shown to a tenant who marks something an emergency so they call rather than wait.
+- Limits: six open reports or five in one day per tenant, four photos each, resized to 1400px. Deleting a work order deletes its photos from disk.
+
+Photos live in `DATA_DIR/photos` beside the database, not inside it, so a backup file does not contain them. Viewing one requires a login.
+
 ## Not in this version
 
-Autopay (saved bank account drafted on the due day), tenant maintenance requests, and text-message reminders. Those are the next phases and slot in without changing the ledger.
+Autopay (saved bank account drafted on the due day) and text-message reminders. Those are the next phases and slot in without changing the ledger.
 
 Built by NormalGuyAI.

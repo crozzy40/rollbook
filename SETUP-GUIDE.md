@@ -41,6 +41,12 @@ Once a month: **Export → Download backup**. Keep the file. It's your whole boo
 6. Try it before telling tenants: Stripe has a **Test mode** switch; use its test secret key first (it starts with `sk_test_`), open one of your own pay links, and pay with Stripe's fake bank account (account `000123456789`, routing `110000000`). When it lands on the ledger, switch to the live key.
 7. Each tenant's private pay link is on their unit page. Text it or email it once; they can bookmark it.
 
+## Part 4 — Repair requests (nothing to set up)
+
+The same link tenants pay from also lets them report a repair, with photos taken on their phone. Those land in **Work orders**, newest emergencies first, and the menu shows a count until you look. You can type a line they'll see next to it ("Plumber coming Thursday"), and marking it done tells them it's fixed and offers to log the cost as an expense.
+
+Two things worth doing once, in **Settings → Repair requests**: leave the form switched on, and add the phone number you want a tenant to call for a true emergency (flooding, no heat, gas). They'll see it the moment they pick Emergency.
+
 What it costs: nothing monthly. A bank payment costs 0.8% capped at $5, so a $3,500 rent costs $5. A card payment costs 2.9% plus 30¢ (about $102 on $3,500), which is why bank payments will be the default and cards optional. If a tenant's bank payment bounces, Stripe charges $4 for the failed attempt, the same way a bounced check costs you a fee.
 
 ---

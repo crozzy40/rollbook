@@ -13,6 +13,7 @@ const auth = require('./lib/auth');
 const importer = require('./lib/importer');
 const demo = require('./lib/demo');
 const pay = require('./lib/pay');
+const photos = require('./lib/photos');
 const stripe = require('./lib/stripe');
 const V = require('./lib/views');
 const V2 = require('./lib/views2');
@@ -80,6 +81,7 @@ function ctxFor(req, token) {
     portfolioName: getSetting('portfolio_name', 'My properties'),
     ownerName: getSetting('owner_name', ''),
     owedCount: rows.filter(r => r.balance > 0).length,
+    newReports: token ? db.prepare(`SELECT COUNT(*) c FROM work_orders WHERE source = 'tenant' AND status = 'open' AND seen = 0`).get().c : 0,
     buildings,
     buildingId: null,
     building: null,
@@ -212,7 +214,7 @@ get('/buildings/:id', (req, res, ctx, token, q, p) => {
   const since30 = L.todayISO(new Date(Date.now() - 30 * 86400000)), since60 = L.todayISO(new Date(Date.now() - 60 * 86400000));
   const recentPayments = db.prepare(`SELECT p.date, p.amount, p.method, t.tenant_name, u.id AS unit_id, u.label AS unit_label, u.kind AS unit_kind FROM payments p JOIN tenancies t ON t.id = p.tenancy_id JOIN units u ON u.id = t.unit_id WHERE u.building_id = ? AND p.date >= ? ORDER BY p.date DESC, p.id DESC LIMIT 8`).all(b.id, since30);
   const expenses = db.prepare(`SELECT * FROM expenses WHERE building_id = ? AND date >= ? ORDER BY date DESC, id DESC LIMIT 8`).all(b.id, since60);
-  const work = db.prepare(`SELECT w.*, u.label AS unit_label FROM work_orders w LEFT JOIN units u ON u.id = w.unit_id WHERE w.building_id = ? AND w.status = 'open' ORDER BY w.opened_at DESC LIMIT 8`).all(b.id);
+  const work = db.prepare(`SELECT w.*, u.label AS unit_label FROM work_orders w LEFT JOIN units u ON u.id = w.unit_id WHERE w.building_id = ? AND w.status = 'open' ORDER BY CASE w.urgency WHEN 'emergency' THEN 0 WHEN 'urgent' THEN 1 ELSE 2 END, w.opened_at DESC LIMIT 8`).all(b.id);
   const leases = rows.filter(r => r.lease_end).map(r => ({ ...r, days: L.daysBetween(today, r.lease_end) })).filter(r => r.days <= 90).sort((a, c) => a.days - c.days).slice(0, 8);
   html(res, V.buildingHome(ctx, { b, units, month: { period: cur, due: L.round2(due), collected: L.round2(collected), expenses: L.round2(spent) }, owedRows, expenses, work, leases, recentPayments }));
 });
@@ -489,9 +491,15 @@ get('/leases', (req, res, ctx) => html(res, V2.leasesPage(ctx, L.portfolioRows()
 get('/more', (req, res, ctx) => html(res, V.morePage(ctx)));
 
 // ---------------------------------------------------------------- work orders
-get('/work', (req, res, ctx) => {
-  const all = db.prepare(`SELECT w.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name, u.label AS unit_label FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id ORDER BY w.opened_at DESC, w.id DESC`).all();
-  html(res, V2.workPage(ctx, { open: all.filter(w => w.status === 'open'), done: all.filter(w => w.status === 'done').slice(0, 25), buildings: buildingsAll(), units: unitsAll() }));
+get('/work', (req, res, ctx, token, q) => {
+  const all = db.prepare(`SELECT w.*, COALESCE(NULLIF(b.display_name, ''), b.name) AS building_name, u.label AS unit_label, t.tenant_name
+                          FROM work_orders w JOIN buildings b ON b.id = w.building_id LEFT JOIN units u ON u.id = w.unit_id LEFT JOIN tenancies t ON t.id = w.tenancy_id
+                          ORDER BY CASE w.urgency WHEN 'emergency' THEN 0 WHEN 'urgent' THEN 1 ELSE 2 END, w.opened_at DESC, w.id DESC`).all();
+  const open = all.filter(w => w.status === 'open');
+  const done = all.filter(w => w.status === 'done').slice(0, 25);
+  const pics = photos.forRefs('work_order', [...open, ...done].map(w => w.id));
+  if (open.some(w => !w.seen)) db.prepare(`UPDATE work_orders SET seen = 1 WHERE status = 'open' AND seen = 0`).run();
+  html(res, V2.workPage(ctx, { open, done, pics, buildings: buildingsAll(), units: unitsAll() }));
 });
 get('/work/new', (req, res, ctx, token, q) => {
   const buildings = buildingsAll();
@@ -501,25 +509,27 @@ get('/work/new', (req, res, ctx, token, q) => {
   html(res, V2.workForm(ctx, { w: pre, buildings, units: unitsAll(), isNew: true }));
 });
 function workFromForm(f) {
-  return { building_id: Number(f.building_id) || 0, unit_id: Number(f.unit_id) || null, title: S(f.title, 200), notes: S(f.notes, 2000), vendor: S(f.vendor, 120), opened_at: D(f.opened_at) || L.todayISO(), cost: N(f.cost), status: f.status === 'done' ? 'done' : 'open' };
+  return { building_id: Number(f.building_id) || 0, unit_id: Number(f.unit_id) || null, title: S(f.title, 200), notes: S(f.notes, 2000), vendor: S(f.vendor, 120), opened_at: D(f.opened_at) || L.todayISO(), cost: N(f.cost), status: f.status === 'done' ? 'done' : 'open', urgency: ['emergency', 'urgent', 'normal'].includes(f.urgency) ? f.urgency : 'normal', tenant_note: S(f.tenant_note, 300) };
 }
 post('/work/new', async (req, res, ctx) => {
   const w = workFromForm(parseForm(await readBody(req)));
   if (!w.title || !buildingById(w.building_id)) return redirect(res, '/work/new', { kind: 'error', text: 'Say what needs doing and where.' });
-  db.prepare(`INSERT INTO work_orders(building_id,unit_id,title,notes,vendor,status,opened_at,closed_at,cost,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(w.building_id, w.unit_id, w.title, w.notes, w.vendor, w.status, w.opened_at, w.status === 'done' ? L.todayISO() : null, w.cost, now());
+  db.prepare(`INSERT INTO work_orders(building_id,unit_id,title,notes,vendor,status,opened_at,closed_at,cost,created_at,urgency,source,seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,'owner',1)`).run(w.building_id, w.unit_id, w.title, w.notes, w.vendor, w.status, w.opened_at, w.status === 'done' ? L.todayISO() : null, w.cost, now(), w.urgency);
   redirect(res, '/work', { text: 'Work order opened.' });
 });
 get('/work/:id/edit', (req, res, ctx, token, q, p) => {
   const w = db.prepare('SELECT * FROM work_orders WHERE id = ?').get(p.id); if (!w) return notFound(req, res, ctx);
   inBuilding(ctx, w.building_id);
+  w.pics = photos.forRef('work_order', w.id);
+  if (w.tenancy_id) w.reporter = (db.prepare('SELECT tenant_name FROM tenancies WHERE id = ?').get(w.tenancy_id) || {}).tenant_name;
   html(res, V2.workForm(ctx, { w, buildings: buildingsAll(), units: unitsAll(), isNew: false }));
 });
 post('/work/:id/edit', async (req, res, ctx, token, q, p) => {
   const w0 = db.prepare('SELECT * FROM work_orders WHERE id = ?').get(p.id); if (!w0) return notFound(req, res, ctx);
   const w = workFromForm(parseForm(await readBody(req)));
   if (!w.title) return redirect(res, `/work/${w0.id}/edit`, { kind: 'error', text: 'Say what needs doing.' });
-  db.prepare('UPDATE work_orders SET building_id=?, unit_id=?, title=?, notes=?, vendor=?, status=?, opened_at=?, closed_at=?, cost=? WHERE id = ?')
-    .run(w.building_id || w0.building_id, w.unit_id, w.title, w.notes, w.vendor, w.status, w.opened_at, w.status === 'done' ? (w0.closed_at || L.todayISO()) : null, w.cost, w0.id);
+  db.prepare('UPDATE work_orders SET building_id=?, unit_id=?, title=?, notes=?, vendor=?, status=?, opened_at=?, closed_at=?, cost=?, urgency=?, tenant_note=? WHERE id = ?')
+    .run(w.building_id || w0.building_id, w.unit_id, w.title, w.notes, w.vendor, w.status, w.opened_at, w.status === 'done' ? (w0.closed_at || L.todayISO()) : null, w.cost, w.urgency, w.tenant_note, w0.id);
   redirect(res, '/work', { text: 'Saved.' });
 });
 get('/work/:id/done', (req, res, ctx, token, q, p) => {
@@ -530,6 +540,7 @@ get('/work/:id/done', (req, res, ctx, token, q, p) => {
       <div class="fields"><div class="field"><label for="c">Final cost</label><div class="money-input"><input id="c" type="number" step="0.01" min="0" name="cost" value="${w.cost ? w.cost.toFixed(2) : ''}"></div></div>
       <div class="field"><label for="cat">Expense category</label><select id="cat" name="category">${CATEGORIES.map(c => `<option ${c === 'Repairs & maintenance' ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
       <div class="field"><label for="d">Completed on</label><input id="d" type="date" name="closed_at" value="${L.todayISO()}"></div></div>
+      ${w.tenancy_id ? `<div class="field"><label for="tn">Note the tenant sees</label><input id="tn" type="text" name="tenant_note" maxlength="300" value="Fixed" placeholder="e.g. Fixed, new faucet installed"><div class="help">Shown on their pay link beside this repair.</div></div>` : ''}
       <div class="checkline" style="margin-bottom:16px"><input type="checkbox" id="ae" name="add_expense" value="1" checked><label for="ae" style="margin:0">Also log the cost as an expense</label></div>
       <div class="actions"><button class="btn" type="submit">Mark done</button><a class="btn secondary" href="/work">Cancel</a></div></form>` }));
 });
@@ -538,7 +549,7 @@ post('/work/:id/done', async (req, res, ctx, token, q, p) => {
   const f = parseForm(await readBody(req));
   const cost = N(f.cost), closed = D(f.closed_at) || L.todayISO();
   transaction(() => {
-    db.prepare(`UPDATE work_orders SET status = 'done', closed_at = ?, cost = ? WHERE id = ?`).run(closed, cost, w.id);
+    db.prepare(`UPDATE work_orders SET status = 'done', closed_at = ?, cost = ?, tenant_note = ? WHERE id = ?`).run(closed, cost, S(f.tenant_note, 300), w.id);
     if (f.add_expense === '1' && cost > 0) db.prepare(`INSERT INTO expenses(building_id,unit_id,date,category,description,vendor,amount,memo,source,created_at) VALUES (?,?,?,?,?,?,?,?,'manual',?)`)
       .run(w.building_id, w.unit_id, closed, CATEGORIES.includes(f.category) ? f.category : 'Repairs & maintenance', w.title, w.vendor, cost, 'From work order', now());
   });
@@ -548,7 +559,13 @@ get('/work/:id/delete', (req, res, ctx, token, q, p) => {
   const w = db.prepare('SELECT * FROM work_orders WHERE id = ?').get(p.id); if (!w) return notFound(req, res, ctx);
   html(res, V.confirmDelete(ctx, { title: 'Delete this work order?', text: w.title, action: `/work/${w.id}/delete`, back: '/work' }));
 });
-post('/work/:id/delete', (req, res, ctx, token, q, p) => { db.prepare('DELETE FROM work_orders WHERE id = ?').run(p.id); redirect(res, '/work', { text: 'Deleted.' }); });
+post('/work/:id/delete', (req, res, ctx, token, q, p) => { photos.removeRef('work_order', Number(p.id)); db.prepare('DELETE FROM work_orders WHERE id = ?').run(p.id); redirect(res, '/work', { text: 'Deleted.' }); });
+post('/work/:id/photos/:pid/delete', (req, res, ctx, token, q, p) => {
+  const row = db.prepare('SELECT * FROM photos WHERE id = ? AND kind = ? AND ref_id = ?').get(p.pid, 'work_order', p.id);
+  if (!row) return notFound(req, res, ctx);
+  photos.removeOne(row.id);
+  redirect(res, `/work/${p.id}/edit`, { text: 'Photo removed.' });
+});
 
 // ---------------------------------------------------------------- reports
 function yearReport(year) {
@@ -623,20 +640,27 @@ get('/backup.sqlite', (req, res) => {
 });
 
 // ---------------------------------------------------------------- settings
-function settingsObj() { return { portfolio_name: getSetting('portfolio_name'), owner_name: getSetting('owner_name'), rent_due_day: getSetting('rent_due_day'), grace_days: getSetting('grace_days'), late_fee_kind: getSetting('late_fee_kind'), late_fee_amount: getSetting('late_fee_amount') }; }
+function settingsObj() { return { portfolio_name: getSetting('portfolio_name'), owner_name: getSetting('owner_name'), rent_due_day: getSetting('rent_due_day'), grace_days: getSetting('grace_days'), late_fee_kind: getSetting('late_fee_kind'), late_fee_amount: getSetting('late_fee_amount'), requests_on: getSetting('requests_on', '1'), emergency_phone: getSetting('emergency_phone', '') }; }
 get('/settings', (req, res, ctx) => html(res, V2.settingsPage(ctx, settingsObj(), db.prepare('SELECT COUNT(*) c FROM buildings WHERE demo = 1').get().c, {
   configured: stripe.isConfigured(), testMode: stripe.isTestMode(), hasWebhook: !!getSetting('stripe_webhook_secret', ''), keyTail: (getSetting('stripe_secret_key', '') || '').slice(-4),
   webhookUrl: `${pay.baseUrl(req)}/stripe/webhook`, pay_bank: getSetting('pay_bank', '1'), pay_card: getSetting('pay_card', '1'), pay_card_fee_to_tenant: getSetting('pay_card_fee_to_tenant', '1'),
   recent: db.prepare(`SELECT o.*, t.tenant_name FROM online_payments o JOIN tenancies t ON t.id = o.tenancy_id ORDER BY o.created_at DESC LIMIT 10`).all() })));
+// Each settings form says which section it is, so saving one never clears another's switches.
 post('/settings', async (req, res, ctx) => {
   const f = parseForm(await readBody(req));
-  setSetting('portfolio_name', S(f.portfolio_name, 80) || 'My properties');
-  setSetting('owner_name', S(f.owner_name, 80));
-  setSetting('rent_due_day', String(Math.min(28, Math.max(1, Number(f.rent_due_day) || 1))));
-  setSetting('grace_days', String(Math.min(31, Math.max(0, Number(f.grace_days) || 0))));
-  setSetting('late_fee_kind', f.late_fee_kind === 'percent' ? 'percent' : 'flat');
-  setSetting('late_fee_amount', String(Math.max(0, N(f.late_fee_amount))));
-  redirect(res, '/settings', { text: 'Settings saved.' });
+  const section = f.section === 'requests' ? 'requests' : 'rules';
+  if (section === 'rules') {
+    setSetting('portfolio_name', S(f.portfolio_name, 80) || 'My properties');
+    setSetting('owner_name', S(f.owner_name, 80));
+    setSetting('rent_due_day', String(Math.min(28, Math.max(1, Number(f.rent_due_day) || 1))));
+    setSetting('grace_days', String(Math.min(31, Math.max(0, Number(f.grace_days) || 0))));
+    setSetting('late_fee_kind', f.late_fee_kind === 'percent' ? 'percent' : 'flat');
+    setSetting('late_fee_amount', String(Math.max(0, N(f.late_fee_amount))));
+  } else {
+    setSetting('requests_on', f.requests_on === '1' ? '1' : '0');
+    setSetting('emergency_phone', S(f.emergency_phone, 40));
+  }
+  redirect(res, section === 'requests' ? '/settings#requests' : '/settings', { text: 'Settings saved.' });
 });
 post('/settings/password', async (req, res, ctx, token) => {
   const f = parseForm(await readBody(req));
@@ -673,13 +697,31 @@ async function handlePublic(req, res, url) {
     return json(res, { received: true, result });
   }
   if (payThrottled(ip)) return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">Too many requests. Try again in a minute.</p>', 429);
-  const m = url.pathname.match(/^\/pay\/([A-Za-z0-9]{8,20})(?:\/(checkout|done))?$/);
+  const m = url.pathname.match(/^\/pay\/([A-Za-z0-9]{8,20})(?:\/(checkout|done|fix))?$/);
   if (!m) return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">This link is not valid.</p>', 404);
   const t = pay.tenancyByToken(m[1]);
   if (!t || t.status !== 'active') return html(res, '<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:40px">This payment link is no longer active. Please contact your landlord.</p>', 404);
   L.postRentCharges();
   const configured = stripe.isConfigured();
-  if (!m[2] && req.method === 'GET') return html(res, pay.payPage(t, { portfolio, configured }), 200, { 'X-Robots-Tag': 'noindex' });
+  const requestsOn = getSetting('requests_on', '1') === '1';
+  const emergencyPhone = getSetting('emergency_phone', '');
+  if (!m[2] && req.method === 'GET') return html(res, pay.payPage(t, { portfolio, configured, requestsOn }), 200, { 'X-Robots-Tag': 'noindex' });
+  if (m[2] === 'fix') {
+    if (!requestsOn) return redirect(res, `/pay/${m[1]}`);
+    if (req.method === 'GET') {
+      if (url.searchParams.get('sent') === '1') return html(res, pay.fixSentPage(t, { portfolio, emergencyPhone }), 200, { 'X-Robots-Tag': 'noindex' });
+      return html(res, pay.fixPage(t, { portfolio, emergencyPhone }), 200, { 'X-Robots-Tag': 'noindex' });
+    }
+    if (req.method === 'POST') {
+      let body; try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) { return json(res, { ok: false, error: 'Could not read that.' }, 400); }
+      const title = S(body.title, 120);
+      if (!title) return json(res, { ok: false, error: 'Tell us what is wrong first.' }, 400);
+      if (pay.tooManyRequests(t.id)) return json(res, { ok: false, error: 'You have several repairs open already. Please call your landlord about anything urgent.' }, 429);
+      const out = pay.createRequest(t, { title, notes: S(body.notes, 1200), urgency: S(body.urgency, 20), photoData: Array.isArray(body.photos) ? body.photos : [] });
+      console.log(`repair reported: ${title} (unit ${t.unit_label}, ${out.photos} photo(s))`);
+      return json(res, { ok: true, id: out.id });
+    }
+  }
   if (m[2] === 'checkout' && req.method === 'POST') {
     const f = parseForm(await readBody(req));
     const amount = N(f.amount);

@@ -326,3 +326,12 @@ h1 .rename { font-family: var(--sans); font-size: 13px; font-weight: 500; margin
   .where-switch select { max-width: 130px; }
   .bhero.placeholder .big { display: none; }
 }
+
+/* ---------- repair photos ---------- */
+.thumbs { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 3px; border: 1px solid var(--rule); display: block; background: var(--rule); }
+.thumbs.big { gap: 14px; }
+.thumbs.big img { width: 150px; height: 150px; }
+.thumbs .shot { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.ledger tr.hot td { background: var(--red-soft); }
+.ledger tr.hot td:first-child { box-shadow: inset 3px 0 0 var(--red); }
